@@ -1,0 +1,30 @@
+﻿# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Runtime / generated
+uploads/
+temp/
+*.log
+*.sqlite
+login_debug.txt
+api_debug_status.txt
+LATEST_CRASH.txt
+error_log*.txt
+
+# Large artifacts
+*.zip
+backend*.zip
+*.pdf
+sampledata.archive
+
+# Secrets
+config/superadmin-*.json
+
+# Misc
+.DS_Store
+.vscode/

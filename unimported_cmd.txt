@@ -1,0 +1,104 @@
+(node:13340) ExperimeNDAlWarning: CommonJS module C:\Program Files\nodejs\node_modules\npm\node_modules\debug\src\node.js is loading ES Module C:\Program Files\nodejs\node_modules\npm\node_modules\supports-color\index.js using require().
+Support for loading ES Module in require() is an experimeNDAl feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+- initializing
+
+       summary               unimported v1.31.0 (node)
+────────────────────────────────────────────────
+       entry file          : server.js
+
+       unresolved imports  : 0
+       unused dependencies : 1
+       unimported files    : 76
+
+
+─────┬──────────────────────────────────────────
+     │ 1 unused dependencies
+─────┼──────────────────────────────────────────
+   1 │ form-data
+─────┴──────────────────────────────────────────
+
+
+─────┬──────────────────────────────────────────
+     │ 76 unimported files
+─────┼──────────────────────────────────────────
+   1 │ activate-prakash.js
+   2 │ check-sfj-user.js
+   3 │ create-sfj-admin.js
+   4 │ create-super-admin.js
+   5 │ debug-sfj-login.js
+   6 │ debug-students.js
+   7 │ debug-trainer-data.js
+   8 │ find-prakash.js
+   9 │ fix-prakash-profile.js
+  10 │ fix-sfj-password.js
+  11 │ list-users.js
+  12 │ middleware/authorize.js
+  13 │ migrate-trainer-status.js
+  14 │ models/OtpAttempt.js
+  15 │ path_test.js
+  16 │ rename-correct-prakash.js
+  17 │ rename-prakash.js
+  18 │ routes/authRoutes_signup_snippet.js
+  19 │ routes/testUploadRoutes.js
+  20 │ scripts/admin/activate_phone_user.js
+  21 │ scripts/admin/activate_superadmin.js
+  22 │ scripts/admin/activate_user.js
+  23 │ scripts/admin/create_dummy_trainer.js
+  24 │ scripts/admin/create_spoc_admin.js
+  25 │ scripts/admin/create_test_schedule.js
+  26 │ scripts/admin/createSuperAdmin.js
+  27 │ scripts/admin/find_course.js
+  28 │ scripts/admin/find_valid_schedule.js
+  29 │ scripts/admin/get_ids.js
+  30 │ scripts/admin/get_token.js
+  31 │ scripts/admin/link_user_company.js
+  32 │ scripts/admin/list_admins.js
+  33 │ scripts/admin/list_users.js
+  34 │ scripts/admin/promote_user.js
+  35 │ scripts/admin/remove_conflicting_phone.js
+  36 │ scripts/admin/reset_password.js
+  37 │ scripts/admin/reset_schedule.js
+  38 │ scripts/admin/reset_trainer_password.js
+  39 │ scripts/admin/update_attendance_geo.js
+  40 │ scripts/admin/update_college_geo.js
+  41 │ scripts/admin/update_env.js
+  42 │ scripts/admin/update_password.js
+  43 │ scripts/admin/view_users.js
+  44 │ scripts/fix_student_count.js
+  45 │ scripts/manual_password_reset.js
+  46 │ scripts/migration/consolidate_trainers.js
+  47 │ scripts/migration/fix_email_verification.js
+  48 │ scripts/migration/fix_passwords.js
+  49 │ scripts/migration/fix_trainer_data.js
+  50 │ scripts/migration/fixDuplicates.js
+  51 │ scripts/migration/manual_sync.js
+  52 │ scripts/migration/migrate_attendance.js
+  53 │ scripts/migration/migrate_trainers.js
+  54 │ scripts/migration/sync_db.js
+  55 │ scripts/reset-all-trainers.js
+  56 │ scripts/reset-user-password.js
+  57 │ scripts/seed/autoSeed_partial.js
+  58 │ scripts/seed/quickSeed.js
+  59 │ scripts/seed/seedData.js
+  60 │ scripts/seed/seedDocument.js
+  61 │ scripts/seed/seedFullData.js
+  62 │ scripts/seed/seedTrainer.js
+  63 │ scripts/seed/seedUser.js
+  64 │ scripts/sendTestEmail.js
+  65 │ scripts/system_check.js
+  66 │ services/msg91Service.js
+  67 │ test_db.js
+  68 │ test-checkin-api.js
+  69 │ test-company-login-api.js
+  70 │ test-email-direct.js
+  71 │ test-login-http.js
+  72 │ test-save-validation.js
+  73 │ test-sfj-login.js
+  74 │ utils/bankVerification.js
+  75 │ utils/mailer.js
+  76 │ verify-user.js
+─────┴──────────────────────────────────────────
+
+
+       Inspect the results and run npx unimported -u to update ignore lists
