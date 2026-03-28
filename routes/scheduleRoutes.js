@@ -4,12 +4,378 @@ const fs = require('fs');
 const path = require('path');
 const xlsx = require('xlsx');
 const dayjs = require('dayjs');
-const { Schedule, Trainer, College, Company, Course, User, Attendance, Notification, ActivityLog } = require('../models');
+const { Schedule, Trainer, College, Company, Course, Department, User, Attendance, Notification, ActivityLog } = require('../models');
 const { sendBulkScheduleEmail, sendScheduleChangeEmail } = require('../utils/emailService');
+const { parseDepartments } = require('../utils/departmentAccess');
+const {
+    ensureCompanyHierarchy,
+    ensureCollegeHierarchy,
+    ensureDepartmentHierarchy,
+    isTrainingDriveEnabled,
+    toDepartmentDayFolders,
+} = require('../services/googleDriveTrainingHierarchyService');
 const { notifyTrainerSchedule } = require('../services/notificationService');
 const authenticate = require('../middleware/auth').authenticate;
 const authorize = require('../middleware/auth').authorize;
 const { autoCreateTrainerAdminChannels } = require('../services/streamChatService');
+
+const toDayNumber = (value) => {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+};
+
+const toFolderString = (value) => {
+    const normalized = String(value || '').trim();
+    return normalized || null;
+};
+
+const findDayFolderEntry = (dayFolders, dayNumber) => {
+    if (!Array.isArray(dayFolders) || !Number.isFinite(dayNumber)) return null;
+    return dayFolders.find((item) => Number(item?.day) === Number(dayNumber)) || null;
+};
+
+const hasAttendanceDocs = (attendance) =>
+    Boolean(attendance?.attendancePdfUrl || attendance?.attendanceExcelUrl);
+
+const hasGeoTagDocs = (attendance) =>
+    Boolean(
+        attendance?.signatureUrl
+        || attendance?.studentsPhotoUrl
+        || attendance?.checkOutGeoImageUrl
+        || (Array.isArray(attendance?.checkOutGeoImageUrls) && attendance.checkOutGeoImageUrls.length)
+        || (Array.isArray(attendance?.activityPhotos) && attendance.activityPhotos.length)
+        || (Array.isArray(attendance?.activityVideos) && attendance.activityVideos.length)
+    );
+
+const normalizeDayStatus = (value) => {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'completed') return 'completed';
+    if (normalized === 'pending') return 'pending';
+    if (normalized === 'not_assigned') return 'not_assigned';
+    return null;
+};
+
+const buildDayUploadStatus = (schedule, attendance) => {
+    const attendanceUploaded = typeof schedule?.attendanceUploaded === 'boolean'
+        ? schedule.attendanceUploaded
+        : hasAttendanceDocs(attendance);
+    const geoTagUploaded = typeof schedule?.geoTagUploaded === 'boolean'
+        ? schedule.geoTagUploaded
+        : hasGeoTagDocs(attendance);
+    const persistedDayStatus = normalizeDayStatus(schedule?.dayStatus);
+    if (persistedDayStatus) {
+        return {
+            attendanceUploaded,
+            geoTagUploaded,
+            statusCode: persistedDayStatus,
+            statusLabel: persistedDayStatus === 'completed'
+                ? 'Completed'
+                : persistedDayStatus === 'pending'
+                    ? 'Pending'
+                    : 'Not Assigned',
+        };
+    }
+    const normalizedScheduleStatus = String(schedule?.status || '').trim().toLowerCase();
+    const hasTrainerAssigned = Boolean(schedule?.trainerId);
+    const docsRejected = String(attendance?.verificationStatus || '').trim().toLowerCase() === 'rejected'
+        || String(attendance?.geoVerificationStatus || '').trim().toLowerCase() === 'rejected';
+
+    if (!hasTrainerAssigned || normalizedScheduleStatus === 'cancelled') {
+        return {
+            attendanceUploaded,
+            geoTagUploaded,
+            statusCode: 'not_assigned',
+            statusLabel: 'Not Assigned',
+        };
+    }
+
+    if (attendanceUploaded && geoTagUploaded && !docsRejected) {
+        return {
+            attendanceUploaded,
+            geoTagUploaded,
+            statusCode: 'completed',
+            statusLabel: 'Completed',
+        };
+    }
+
+    return {
+        attendanceUploaded,
+        geoTagUploaded,
+        statusCode: 'pending',
+        statusLabel: 'Pending',
+    };
+};
+
+const normalizeScheduleLifecycleStatus = (value) => {
+    const normalized = String(value || '').trim().toUpperCase();
+    if (normalized === 'COMPLETED') return 'COMPLETED';
+    if (normalized === 'IN_PROGRESS' || normalized === 'INPROGRESS') return 'inprogress';
+    if (normalized === 'ASSIGNED' || normalized === 'SCHEDULED') return 'scheduled';
+    if (normalized === 'CANCELLED') return 'cancelled';
+    return String(value || '').trim() || 'scheduled';
+};
+
+const deriveTrainerScheduleStatus = (schedule, attendance) => {
+    const rawStatus = normalizeScheduleLifecycleStatus(schedule?.status);
+    const attendanceVerification = String(attendance?.verificationStatus || '').trim().toLowerCase();
+    const geoVerification = String(attendance?.geoVerificationStatus || '').trim().toLowerCase();
+
+    if (attendanceVerification === 'rejected') {
+        return 'scheduled';
+    }
+
+    if (attendanceVerification === 'approved' && geoVerification === 'approved') {
+        return 'COMPLETED';
+    }
+
+    if (attendanceVerification === 'approved') {
+        return 'inprogress';
+    }
+
+    return rawStatus;
+};
+
+const buildDayStatusTooltip = (schedule, { attendanceUploaded = false, geoTagUploaded = false, statusCode = 'not_assigned' } = {}) => {
+    if (statusCode === 'not_assigned') return 'Trainer not assigned';
+    if (statusCode === 'completed') return 'All documents uploaded';
+    if (!attendanceUploaded && !geoTagUploaded) return 'Attendance and GeoTag missing';
+    if (!attendanceUploaded) return 'Attendance missing';
+    if (!geoTagUploaded) return 'GeoTag missing';
+    return 'Upload Missing Docs';
+};
+
+const buildScheduleFolderFields = ({
+    dayEntry,
+    fallbackDayFolderId = null,
+    fallbackDayFolderName = null,
+    fallbackDayFolderLink = null,
+    fallbackAttendanceFolderId = null,
+    fallbackAttendanceFolderName = null,
+    fallbackAttendanceFolderLink = null,
+    fallbackGeoTagFolderId = null,
+    fallbackGeoTagFolderName = null,
+    fallbackGeoTagFolderLink = null,
+}) => {
+    const dayFolderId = toFolderString(dayEntry?.folderId) || toFolderString(fallbackDayFolderId);
+    const dayFolderName = toFolderString(dayEntry?.folderName) || toFolderString(dayEntry?.name) || toFolderString(fallbackDayFolderName);
+    const dayFolderLink = toFolderString(dayEntry?.folderLink) || toFolderString(dayEntry?.link) || toFolderString(fallbackDayFolderLink);
+
+    const attendanceFolderId = toFolderString(dayEntry?.attendanceFolderId)
+        || toFolderString(dayEntry?.attendanceFolder?.id)
+        || toFolderString(fallbackAttendanceFolderId);
+    const attendanceFolderName = toFolderString(dayEntry?.attendanceFolderName)
+        || toFolderString(dayEntry?.attendanceFolder?.name)
+        || toFolderString(fallbackAttendanceFolderName);
+    const attendanceFolderLink = toFolderString(dayEntry?.attendanceFolderLink)
+        || toFolderString(dayEntry?.attendanceFolder?.link)
+        || toFolderString(fallbackAttendanceFolderLink);
+
+    const geoTagFolderId = toFolderString(dayEntry?.geoTagFolderId)
+        || toFolderString(dayEntry?.geoTagFolder?.id)
+        || toFolderString(fallbackGeoTagFolderId);
+    const geoTagFolderName = toFolderString(dayEntry?.geoTagFolderName)
+        || toFolderString(dayEntry?.geoTagFolder?.name)
+        || toFolderString(fallbackGeoTagFolderName);
+    const geoTagFolderLink = toFolderString(dayEntry?.geoTagFolderLink)
+        || toFolderString(dayEntry?.geoTagFolder?.link)
+        || toFolderString(fallbackGeoTagFolderLink);
+
+    return {
+        dayFolderId,
+        dayFolderName,
+        dayFolderLink,
+        attendanceFolderId,
+        attendanceFolderName,
+        attendanceFolderLink,
+        geoTagFolderId,
+        geoTagFolderName,
+        geoTagFolderLink,
+        // Backward compatibility for existing consumers
+        driveFolderId: dayFolderId,
+        driveFolderName: dayFolderName,
+        driveFolderLink: dayFolderLink,
+    };
+};
+
+const syncDriveHierarchyMetadata = async ({
+    company,
+    course,
+    college,
+    department,
+    collegeHierarchy,
+    departmentHierarchy,
+}) => {
+    if (company && departmentHierarchy?.companyFolder?.id && company.driveFolderId !== departmentHierarchy.companyFolder.id) {
+        company.driveFolderId = departmentHierarchy.companyFolder.id;
+        company.driveFolderName = departmentHierarchy.companyFolder.name;
+        company.driveFolderLink = departmentHierarchy.companyFolder.link;
+        await company.save();
+    } else if (company && collegeHierarchy?.companyFolder?.id && company.driveFolderId !== collegeHierarchy.companyFolder.id) {
+        company.driveFolderId = collegeHierarchy.companyFolder.id;
+        company.driveFolderName = collegeHierarchy.companyFolder.name;
+        company.driveFolderLink = collegeHierarchy.companyFolder.link;
+        await company.save();
+    }
+
+    if (course && departmentHierarchy?.courseFolder?.id && course.driveFolderId !== departmentHierarchy.courseFolder.id) {
+        course.driveFolderId = departmentHierarchy.courseFolder.id;
+        course.driveFolderName = departmentHierarchy.courseFolder.name;
+        course.driveFolderLink = departmentHierarchy.courseFolder.link;
+        await course.save();
+    } else if (course && collegeHierarchy?.courseFolder?.id && course.driveFolderId !== collegeHierarchy.courseFolder.id) {
+        course.driveFolderId = collegeHierarchy.courseFolder.id;
+        course.driveFolderName = collegeHierarchy.courseFolder.name;
+        course.driveFolderLink = collegeHierarchy.courseFolder.link;
+        await course.save();
+    }
+
+    if (college && departmentHierarchy?.collegeFolder?.id && college.driveFolderId !== departmentHierarchy.collegeFolder.id) {
+        college.driveFolderId = departmentHierarchy.collegeFolder.id;
+        college.driveFolderName = departmentHierarchy.collegeFolder.name;
+        college.driveFolderLink = departmentHierarchy.collegeFolder.link;
+        await college.save();
+    } else if (college && collegeHierarchy?.collegeFolder?.id && college.driveFolderId !== collegeHierarchy.collegeFolder.id) {
+        college.driveFolderId = collegeHierarchy.collegeFolder.id;
+        college.driveFolderName = collegeHierarchy.collegeFolder.name;
+        college.driveFolderLink = collegeHierarchy.collegeFolder.link;
+        await college.save();
+    }
+
+    if (department && departmentHierarchy?.departmentFolder?.id) {
+        let shouldSaveDepartment = false;
+        if (department.driveFolderId !== departmentHierarchy.departmentFolder.id) {
+            department.driveFolderId = departmentHierarchy.departmentFolder.id;
+            department.driveFolderName = departmentHierarchy.departmentFolder.name;
+            department.driveFolderLink = departmentHierarchy.departmentFolder.link;
+            shouldSaveDepartment = true;
+        }
+
+        const dayFolders = toDepartmentDayFolders(departmentHierarchy?.dayFoldersByDayNumber || {});
+        if (dayFolders.length) {
+            department.dayFolders = dayFolders;
+            shouldSaveDepartment = true;
+        }
+
+        if (shouldSaveDepartment) {
+            await department.save();
+        }
+    }
+};
+
+const ensureScheduleDriveFolderFields = async ({
+    companyId,
+    courseId,
+    collegeId,
+    departmentId,
+    dayNumber,
+    fallbackFields = {},
+}) => {
+    const normalizedDayNumber = toDayNumber(dayNumber);
+
+    let dayEntry = null;
+    if (departmentId && Number.isFinite(normalizedDayNumber)) {
+        const department = await Department.findById(departmentId).select('dayFolders');
+        dayEntry = findDayFolderEntry(department?.dayFolders || [], normalizedDayNumber);
+    }
+
+    const defaultFields = buildScheduleFolderFields({
+        dayEntry,
+        fallbackDayFolderId: fallbackFields.dayFolderId || fallbackFields.driveFolderId,
+        fallbackDayFolderName: fallbackFields.dayFolderName || fallbackFields.driveFolderName,
+        fallbackDayFolderLink: fallbackFields.dayFolderLink || fallbackFields.driveFolderLink,
+        fallbackAttendanceFolderId: fallbackFields.attendanceFolderId,
+        fallbackAttendanceFolderName: fallbackFields.attendanceFolderName,
+        fallbackAttendanceFolderLink: fallbackFields.attendanceFolderLink,
+        fallbackGeoTagFolderId: fallbackFields.geoTagFolderId,
+        fallbackGeoTagFolderName: fallbackFields.geoTagFolderName,
+        fallbackGeoTagFolderLink: fallbackFields.geoTagFolderLink,
+    });
+
+    if (!isTrainingDriveEnabled() || !collegeId || !Number.isFinite(normalizedDayNumber)) {
+        return defaultFields;
+    }
+
+    const [company, course, college, department] = await Promise.all([
+        companyId ? Company.findById(companyId).select('name driveFolderId driveFolderName driveFolderLink') : null,
+        courseId ? Course.findById(courseId).select('title driveFolderId driveFolderName driveFolderLink') : null,
+        College.findById(collegeId).select('name companyId courseId driveFolderId driveFolderName driveFolderLink'),
+        departmentId ? Department.findById(departmentId).select('_id name companyId courseId collegeId driveFolderId driveFolderName driveFolderLink dayFolders') : null,
+    ]);
+
+    if (!college) {
+        return defaultFields;
+    }
+
+    let ensuredDayEntry = null;
+    if (department?._id) {
+        const companyRef = company || (department.companyId || college.companyId
+            ? { _id: department.companyId || college.companyId, name: `Company_${department.companyId || college.companyId}` }
+            : null);
+        const courseRef = course || null;
+
+        if (!companyRef?._id) {
+            return defaultFields;
+        }
+
+        const departmentHierarchy = await ensureDepartmentHierarchy({
+            company: companyRef,
+            course: courseRef,
+            college,
+            department,
+            totalDays: Math.max(12, normalizedDayNumber),
+        });
+
+        await syncDriveHierarchyMetadata({
+            company,
+            course,
+            college,
+            department,
+            departmentHierarchy,
+        });
+
+        const ensuredDay = departmentHierarchy?.dayFoldersByDayNumber?.[normalizedDayNumber];
+        if (ensuredDay?.id) {
+            ensuredDayEntry = {
+                folderId: ensuredDay.id,
+                folderName: ensuredDay.name || null,
+                folderLink: ensuredDay.link || null,
+                attendanceFolderId: ensuredDay.attendanceFolder?.id || null,
+                attendanceFolderName: ensuredDay.attendanceFolder?.name || null,
+                attendanceFolderLink: ensuredDay.attendanceFolder?.link || null,
+                geoTagFolderId: ensuredDay.geoTagFolder?.id || null,
+                geoTagFolderName: ensuredDay.geoTagFolder?.name || null,
+                geoTagFolderLink: ensuredDay.geoTagFolder?.link || null,
+            };
+        }
+    } else if ((company || college.companyId) && normalizedDayNumber) {
+        const companyRef = company || { _id: college.companyId, name: `Company_${college.companyId}` };
+        const collegeHierarchy = await ensureCollegeHierarchy({
+            company: companyRef,
+            course: course || null,
+            college,
+        });
+
+        await syncDriveHierarchyMetadata({
+            company,
+            course,
+            college,
+            collegeHierarchy,
+        });
+    }
+
+    return buildScheduleFolderFields({
+        dayEntry: ensuredDayEntry || dayEntry,
+        fallbackDayFolderId: defaultFields.dayFolderId,
+        fallbackDayFolderName: defaultFields.dayFolderName,
+        fallbackDayFolderLink: defaultFields.dayFolderLink,
+        fallbackAttendanceFolderId: defaultFields.attendanceFolderId,
+        fallbackAttendanceFolderName: defaultFields.attendanceFolderName,
+        fallbackAttendanceFolderLink: defaultFields.attendanceFolderLink,
+        fallbackGeoTagFolderId: defaultFields.geoTagFolderId,
+        fallbackGeoTagFolderName: defaultFields.geoTagFolderName,
+        fallbackGeoTagFolderLink: defaultFields.geoTagFolderLink,
+    });
+};
 
 // @route   POST /api/schedules/create
 // @desc    Create a single schedule
@@ -32,6 +398,14 @@ router.post('/create', async (req, res) => {
         const createdBy = req.body.createdBy || req.user?.id;
 
         const college = await College.findById(collegeId);
+        const folderFields = await ensureScheduleDriveFolderFields({
+            companyId,
+            courseId,
+            collegeId,
+            departmentId,
+            dayNumber,
+            fallbackFields: req.body,
+        });
 
         const schedule = await Schedule.create({
             trainerId,
@@ -46,7 +420,8 @@ router.post('/create', async (req, res) => {
             endTime,
             subject,
             createdBy,
-            status: 'scheduled'
+            status: 'scheduled',
+            ...folderFields,
         });
 
         res.status(201).json({
@@ -138,27 +513,189 @@ router.post('/bulk-create', async (req, res) => {
             });
         }
 
+        const toDateKey = (value) => {
+            const parsed = new Date(value);
+            if (Number.isNaN(parsed.getTime())) return null;
+            return parsed.toISOString().slice(0, 10);
+        };
+
+        const keyForSchedule = (schedule) => ([
+            String(schedule.trainerId || ''),
+            String(schedule.collegeId || ''),
+            String(schedule.departmentId || 'null'),
+            String(schedule.dayNumber ?? ''),
+            String(toDateKey(schedule.scheduledDate) || ''),
+        ].join('::'));
+        const keyForDaySlot = (schedule) => ([
+            String(schedule.collegeId || ''),
+            String(schedule.departmentId || 'null'),
+            String(schedule.dayNumber ?? ''),
+        ].join('::'));
+
+        const skippedDetails = [];
+        const seenPayloadDaySlots = new Set();
+        const sanitizedSchedules = [];
+
+        schedules.forEach((schedule, index) => {
+            const rowNumber = index + 1;
+            const normalized = { ...schedule };
+            const requiredMissing = !normalized.trainerId
+                || !normalized.collegeId
+                || normalized.dayNumber === undefined
+                || !normalized.scheduledDate
+                || !normalized.startTime
+                || !normalized.endTime;
+
+            if (requiredMissing) {
+                skippedDetails.push({
+                    rowNumber,
+                    reason: 'Missing required fields (trainerId, collegeId, dayNumber, scheduledDate, startTime, endTime)'
+                });
+                return;
+            }
+
+            const daySlotKey = keyForDaySlot(normalized);
+            if (seenPayloadDaySlots.has(daySlotKey)) {
+                skippedDetails.push({
+                    rowNumber,
+                    reason: 'Duplicate day assignment in request payload (same college, department, day)'
+                });
+                return;
+            }
+
+            seenPayloadDaySlots.add(daySlotKey);
+            sanitizedSchedules.push({ ...normalized, _rowNumber: rowNumber });
+        });
+
+        if (!sanitizedSchedules.length) {
+            return res.status(200).json({
+                success: true,
+                message: 'No new schedules to create',
+                inserted: 0,
+                skipped: skippedDetails.length,
+                skippedDetails,
+                data: []
+            });
+        }
+
         // Fetch colleges to get location data
-        const collegeIds = [...new Set(schedules.map(s => s.collegeId))];
+        const collegeIds = [...new Set(sanitizedSchedules.map(s => s.collegeId))];
         const colleges = await College.find({ _id: { $in: collegeIds } });
         const collegeMap = colleges.reduce((acc, c) => {
             acc[c._id.toString()] = c;
             return acc;
         }, {});
 
-        const createdSchedules = await Schedule.insertMany(
-            schedules.map(s => ({
-                ...s,
-                collegeLocation: collegeMap[s.collegeId]?.location || {},
-                createdBy: createdBy || req.user?.id,
-                status: 'scheduled'
-            }))
-        );
+        const existingDaySlotCandidates = await Schedule.find({
+            collegeId: { $in: [...new Set(sanitizedSchedules.map((s) => s.collegeId))] },
+            departmentId: { $in: [...new Set(sanitizedSchedules.map((s) => s.departmentId || null))] },
+            dayNumber: { $in: [...new Set(sanitizedSchedules.map((s) => s.dayNumber))] },
+            isActive: { $ne: false },
+        }).select('_id trainerId collegeId departmentId dayNumber scheduledDate dayFolderId dayFolderName dayFolderLink attendanceFolderId attendanceFolderName attendanceFolderLink geoTagFolderId geoTagFolderName geoTagFolderLink driveFolderId driveFolderName driveFolderLink');
 
-        res.status(201).json({
+        const existingDaySlotMap = new Map();
+        existingDaySlotCandidates.forEach((schedule) => {
+            const key = keyForDaySlot(schedule);
+            if (!existingDaySlotMap.has(key)) {
+                existingDaySlotMap.set(key, schedule);
+            }
+        });
+
+        const updateOps = [];
+        const updatedScheduleIds = new Set();
+        const schedulesToInsert = [];
+        const seenInsertKeys = new Set();
+
+        for (const schedule of sanitizedSchedules) {
+            const rowNumber = schedule._rowNumber || 0;
+            const daySlotKey = keyForDaySlot(schedule);
+            const existingDaySlot = existingDaySlotMap.get(daySlotKey);
+
+            const { _rowNumber, ...schedulePayload } = schedule;
+            const folderFields = await ensureScheduleDriveFolderFields({
+                companyId: schedulePayload.companyId || null,
+                courseId: schedulePayload.courseId || null,
+                collegeId: schedulePayload.collegeId,
+                departmentId: schedulePayload.departmentId || null,
+                dayNumber: schedulePayload.dayNumber,
+                fallbackFields: {
+                    ...existingDaySlot?.toObject?.(),
+                    ...schedulePayload,
+                },
+            });
+
+            if (existingDaySlot?._id) {
+                updateOps.push({
+                    updateOne: {
+                        filter: { _id: existingDaySlot._id },
+                        update: {
+                            $set: {
+                                trainerId: schedulePayload.trainerId,
+                                companyId: schedulePayload.companyId || null,
+                                courseId: schedulePayload.courseId || null,
+                                collegeId: schedulePayload.collegeId,
+                                departmentId: schedulePayload.departmentId || null,
+                                dayNumber: schedulePayload.dayNumber,
+                                scheduledDate: schedulePayload.scheduledDate,
+                                startTime: schedulePayload.startTime,
+                                endTime: schedulePayload.endTime,
+                                subject: schedulePayload.subject || null,
+                                status: 'scheduled',
+                                isActive: true,
+                                collegeLocation: collegeMap[schedule.collegeId]?.location || {},
+                                createdBy: createdBy || req.user?.id,
+                                ...folderFields,
+                            }
+                        }
+                    }
+                });
+                updatedScheduleIds.add(String(existingDaySlot._id));
+                continue;
+            }
+
+            const insertKey = keyForSchedule(schedulePayload);
+            if (seenInsertKeys.has(insertKey)) {
+                skippedDetails.push({
+                    rowNumber,
+                    reason: 'Schedule already exists for this trainer/day/date/department'
+                });
+                continue;
+            }
+
+            seenInsertKeys.add(insertKey);
+            schedulesToInsert.push({
+                ...schedulePayload,
+                collegeLocation: collegeMap[schedule.collegeId]?.location || {},
+                createdBy: createdBy || req.user?.id,
+                status: 'scheduled',
+                ...folderFields,
+            });
+        }
+
+        let createdSchedules = [];
+        if (schedulesToInsert.length) {
+            createdSchedules = await Schedule.insertMany(schedulesToInsert);
+        }
+
+        if (updateOps.length) {
+            await Schedule.bulkWrite(updateOps, { ordered: false });
+        }
+
+        let updatedSchedules = [];
+        if (updatedScheduleIds.size) {
+            updatedSchedules = await Schedule.find({ _id: { $in: [...updatedScheduleIds] } });
+        }
+
+        const affectedSchedules = [...updatedSchedules, ...createdSchedules];
+
+        res.status(200).json({
             success: true,
-            message: `${createdSchedules.length} schedules created successfully`,
-            data: createdSchedules
+            message: `${createdSchedules.length} schedules created, ${updatedSchedules.length} schedules updated`,
+            inserted: createdSchedules.length,
+            updated: updatedSchedules.length,
+            skipped: skippedDetails.length,
+            skippedDetails,
+            data: affectedSchedules
         });
 
         // Trigger Notifications for Bulk Creation
@@ -166,7 +703,7 @@ router.post('/bulk-create', async (req, res) => {
             const trainerAssignments = {};
             
             // Group by trainer
-            for (const schedule of createdSchedules) {
+            for (const schedule of affectedSchedules) {
                 const tId = schedule.trainerId.toString();
                 if (!trainerAssignments[tId]) trainerAssignments[tId] = [];
                 
@@ -396,6 +933,109 @@ router.get('/live-dashboard', authenticate, authorize(['SPOCAdmin', 'SuperAdmin'
     }
 });
 
+// @route   GET /api/schedules/days?departmentId=xxx
+// @desc    Get day status slots for a department
+// @access  SPOC Admin, SuperAdmin
+router.get('/days', authenticate, authorize(['SPOCAdmin', 'SuperAdmin']), async (req, res) => {
+    try {
+        const { departmentId } = req.query;
+
+        if (!departmentId) {
+            return res.status(400).json({ success: false, message: 'departmentId is required' });
+        }
+
+        const schedules = await Schedule.find({ departmentId, isActive: true })
+            .sort({ dayNumber: 1, scheduledDate: 1, createdAt: 1 })
+            .populate({
+                path: 'trainerId',
+                select: 'trainerId phone profilePicture',
+                populate: { path: 'userId', select: 'name email profilePicture' },
+            });
+
+        const scheduleByDay = new Map();
+        for (const schedule of schedules) {
+            const dayNumber = Number(schedule.dayNumber);
+            if (!Number.isFinite(dayNumber) || dayNumber <= 0) continue;
+            if (!scheduleByDay.has(dayNumber)) {
+                scheduleByDay.set(dayNumber, schedule);
+            }
+        }
+
+        const scheduleIds = Array.from(scheduleByDay.values()).map((schedule) => schedule._id);
+        const attendanceDocs = scheduleIds.length
+            ? await Attendance.find({ scheduleId: { $in: scheduleIds } })
+                .sort({ createdAt: -1 })
+                .select('scheduleId status verificationStatus geoVerificationStatus approvedBy latitude longitude studentsPresent studentsAbsent checkInTime checkOutTime attendancePdfUrl attendanceExcelUrl studentsPhotoUrl signatureUrl checkOutGeoImageUrl checkOutGeoImageUrls activityPhotos activityVideos')
+            : [];
+
+        const attendanceBySchedule = new Map();
+        for (const attendance of attendanceDocs) {
+            const key = String(attendance.scheduleId);
+            if (!attendanceBySchedule.has(key)) {
+                attendanceBySchedule.set(key, attendance);
+            }
+        }
+
+        const days = Array.from({ length: 12 }, (_, index) => {
+            const dayNumber = index + 1;
+            const schedule = scheduleByDay.get(dayNumber) || null;
+            const attendance = schedule ? attendanceBySchedule.get(String(schedule._id)) : null;
+            const dayUploadStatus = buildDayUploadStatus(schedule, attendance);
+            const statusTooltip = buildDayStatusTooltip(schedule, dayUploadStatus);
+
+            return {
+                id: schedule?._id || `placeholder-${dayNumber}`,
+                dayNumber,
+                label: `Day ${dayNumber}`,
+                trainerId: schedule?.trainerId?._id || null,
+                trainerName: schedule?.trainerId?.userId?.name || 'Not Assigned',
+                trainerCustomId: schedule?.trainerId?.trainerId || null,
+                date: schedule?.scheduledDate || null,
+                startTime: schedule?.startTime || null,
+                endTime: schedule?.endTime || null,
+                time: schedule?.startTime && schedule?.endTime ? `${schedule.startTime} - ${schedule.endTime}` : null,
+                syllabusName: schedule?.subject || `Day ${dayNumber} Content`,
+                status: dayUploadStatus.statusCode,
+                statusLabel: dayUploadStatus.statusLabel,
+                statusTooltip,
+                attendanceUploaded: dayUploadStatus.attendanceUploaded,
+                geoTagUploaded: dayUploadStatus.geoTagUploaded,
+                verificationStatus: attendance?.verificationStatus || 'pending',
+                geoVerificationStatus: attendance?.geoVerificationStatus || 'pending',
+                driveFolderId: schedule?.driveFolderId || schedule?.dayFolderId || null,
+                driveFolderLink: schedule?.driveFolderLink || schedule?.dayFolderLink || null,
+                dayFolderId: schedule?.dayFolderId || schedule?.driveFolderId || null,
+                dayFolderLink: schedule?.dayFolderLink || schedule?.driveFolderLink || null,
+                attendanceFolderId: schedule?.attendanceFolderId || null,
+                attendanceFolderLink: schedule?.attendanceFolderLink || null,
+                geoTagFolderId: schedule?.geoTagFolderId || null,
+                geoTagFolderLink: schedule?.geoTagFolderLink || null,
+                attendancePdfUrl: attendance?.attendancePdfUrl || null,
+                attendanceExcelUrl: attendance?.attendanceExcelUrl || null,
+                studentsPhotoUrl: attendance?.studentsPhotoUrl || null,
+                signatureUrl: attendance?.signatureUrl || null,
+                checkOutGeoImageUrl: attendance?.checkOutGeoImageUrl || null,
+                checkOutGeoImageUrls: attendance?.checkOutGeoImageUrls || [],
+                activityPhotos: attendance?.activityPhotos || [],
+                activityVideos: attendance?.activityVideos || [],
+                approvedBy: attendance?.approvedBy || null,
+                studentsPresent: attendance?.studentsPresent || 0,
+                studentsAbsent: attendance?.studentsAbsent || 0,
+                checkInTime: attendance?.checkInTime || null,
+                checkOutTime: attendance?.checkOutTime || null,
+                geoTag: attendance?.latitude != null && attendance?.longitude != null
+                    ? `${attendance.latitude}, ${attendance.longitude}`
+                    : null,
+            };
+        });
+
+        return res.json(days);
+    } catch (error) {
+        console.error('Error fetching department day slots:', error);
+        return res.status(500).json({ success: false, message: 'Failed to fetch department day slots', error: error.message });
+    }
+});
+
 // @route   GET /api/schedules/trainer/:trainerId
 // @desc    Get all schedules for a trainer
 // @access  SPOC Admin, Trainer
@@ -429,11 +1069,24 @@ router.get('/trainer/:trainerId', async (req, res) => {
         // Get attendance status for each schedule
         const schedulesWithAttendance = await Promise.all(schedules.map(async (schedule) => {
             const attendance = await Attendance.findOne({ scheduleId: schedule._id }).sort({ createdAt: -1 });
+            const dayUploadStatus = buildDayUploadStatus(schedule, attendance);
+            const trainerScheduleStatus = deriveTrainerScheduleStatus(schedule, attendance);
             return {
                 ...schedule.toObject(),
+                status: trainerScheduleStatus,
+                rawStatus: schedule.status,
+                dayStatus: dayUploadStatus.statusCode,
+                dayStatusLabel: dayUploadStatus.statusLabel,
+                attendanceUploaded: dayUploadStatus.attendanceUploaded,
+                geoTagUploaded: dayUploadStatus.geoTagUploaded,
+                assignedDate: attendance ? attendance.assignedDate || null : null,
+                images: attendance ? attendance.images || [] : [],
+                finalStatus: attendance ? attendance.finalStatus || null : null,
                 attendanceStatus: attendance ? attendance.verificationStatus : null,
                 geoVerificationStatus: attendance ? attendance.geoVerificationStatus : null,
-                verificationComment: attendance ? attendance.verificationComment : null
+                verificationComment: attendance ? attendance.verificationComment : null,
+                geoValidationComment: attendance ? attendance.geoValidationComment : null,
+                checkOut: attendance ? attendance.checkOut || null : null
             };
         }));
 
@@ -505,6 +1158,16 @@ router.put('/:id/assign', authenticate, authorize(['SPOCAdmin']), async (req, re
         schedule.startTime = startTime || schedule.startTime;
         schedule.endTime = endTime || schedule.endTime;
         schedule.status = 'scheduled';
+
+        const folderFields = await ensureScheduleDriveFolderFields({
+            companyId: schedule.companyId || null,
+            courseId: schedule.courseId || null,
+            collegeId: schedule.collegeId,
+            departmentId: schedule.departmentId || null,
+            dayNumber: schedule.dayNumber,
+            fallbackFields: schedule.toObject(),
+        });
+        Object.assign(schedule, folderFields);
 
         const updatedSchedule = await schedule.save();
 
@@ -593,9 +1256,35 @@ router.put('/:id', async (req, res) => {
         if (req.body.endTime !== undefined) schedule.endTime = req.body.endTime;
         if (req.body.status !== undefined) schedule.status = req.body.status;
         if (req.body.subject !== undefined) schedule.subject = req.body.subject;
+        if (req.body.dayNumber !== undefined) schedule.dayNumber = req.body.dayNumber;
+        if (req.body.departmentId !== undefined) schedule.departmentId = req.body.departmentId || null;
+        if (req.body.collegeId !== undefined) schedule.collegeId = req.body.collegeId;
+        if (req.body.companyId !== undefined) schedule.companyId = req.body.companyId || null;
+        if (req.body.courseId !== undefined) schedule.courseId = req.body.courseId || null;
+        if (req.body.attendanceUploaded !== undefined) schedule.attendanceUploaded = Boolean(req.body.attendanceUploaded);
+        if (req.body.geoTagUploaded !== undefined) schedule.geoTagUploaded = Boolean(req.body.geoTagUploaded);
+        if (req.body.dayStatus !== undefined) schedule.dayStatus = req.body.dayStatus;
 
         // Fallback for other fields
-        Object.assign(schedule, req.body);
+        const safeBody = { ...req.body };
+        [
+            'driveFolderId', 'driveFolderName', 'driveFolderLink',
+            'dayFolderId', 'dayFolderName', 'dayFolderLink',
+            'attendanceFolderId', 'attendanceFolderName', 'attendanceFolderLink',
+            'geoTagFolderId', 'geoTagFolderName', 'geoTagFolderLink',
+            'attendanceUploaded', 'geoTagUploaded', 'dayStatus', 'dayStatusUpdatedAt',
+        ].forEach((field) => delete safeBody[field]);
+        Object.assign(schedule, safeBody);
+
+        const folderFields = await ensureScheduleDriveFolderFields({
+            companyId: schedule.companyId || null,
+            courseId: schedule.courseId || null,
+            collegeId: schedule.collegeId,
+            departmentId: schedule.departmentId || null,
+            dayNumber: schedule.dayNumber,
+            fallbackFields: schedule.toObject(),
+        });
+        Object.assign(schedule, folderFields);
         // Capture reschedule reason if it's being updated
         const reason = req.body.rescheduleReason || 'General schedule update by administrator.';
 
@@ -787,7 +1476,7 @@ router.get('/associations/all', async (req, res) => {
         }));
 
         const collegesRaw = await College.find({})
-            .select('_id name companyId courseId')
+            .select('_id name companyId courseId department')
             .sort({ name: 1 });
 
         const colleges = collegesRaw.map(c => ({
@@ -797,12 +1486,65 @@ router.get('/associations/all', async (req, res) => {
             courseId: c.courseId
         }));
 
+        // Sync departments from college.department string (Super Admin college setup)
+        // so legacy colleges without Department documents still appear in Assign dropdowns.
+        const normalizeDepartmentName = (value) => String(value || '').trim().toLowerCase();
+
+        let departmentsRaw = await Department.find({ isActive: { $ne: false } })
+            .select('_id name companyId courseId collegeId')
+            .sort({ name: 1 });
+
+        const existingDepartmentKeys = new Set(
+            departmentsRaw.map((dep) => `${String(dep.collegeId)}::${normalizeDepartmentName(dep.name)}`)
+        );
+
+        const departmentsToInsert = [];
+        collegesRaw.forEach((college) => {
+            const departmentNames = parseDepartments(college.department);
+            departmentNames.forEach((name) => {
+                const key = `${String(college._id)}::${normalizeDepartmentName(name)}`;
+                if (existingDepartmentKeys.has(key)) return;
+                existingDepartmentKeys.add(key);
+
+                departmentsToInsert.push({
+                    name,
+                    companyId: college.companyId || null,
+                    courseId: college.courseId || null,
+                    collegeId: college._id,
+                    isActive: true,
+                });
+            });
+        });
+
+        if (departmentsToInsert.length) {
+            try {
+                await Department.insertMany(departmentsToInsert, { ordered: false });
+            } catch (error) {
+                if (error?.code !== 11000 && error?.name !== 'BulkWriteError') {
+                    throw error;
+                }
+            }
+
+            departmentsRaw = await Department.find({ isActive: { $ne: false } })
+                .select('_id name companyId courseId collegeId')
+                .sort({ name: 1 });
+        }
+
+        const departments = departmentsRaw.map(d => ({
+            id: d._id,
+            name: d.name,
+            companyId: d.companyId,
+            courseId: d.courseId,
+            collegeId: d.collegeId
+        }));
+
         res.json({
             success: true,
             data: {
                 companies,
                 courses,
-                colleges
+                colleges,
+                departments
             }
         });
     } catch (error) {
@@ -897,6 +1639,20 @@ router.post('/bulk-upload', authenticate, authorize(['SPOCAdmin']), (req, res, n
                             registrationNumber: 'TEST-' + Date.now(), 
                             address: 'Test Address' 
                         });
+
+                        if (isTrainingDriveEnabled()) {
+                            try {
+                                const hierarchy = await ensureCompanyHierarchy({ company });
+                                if (hierarchy?.companyFolder?.id) {
+                                    company.driveFolderId = hierarchy.companyFolder.id;
+                                    company.driveFolderName = hierarchy.companyFolder.name;
+                                    company.driveFolderLink = hierarchy.companyFolder.link;
+                                    await company.save();
+                                }
+                            } catch (driveError) {
+                                console.error('[GOOGLE-DRIVE] Failed to create company folder for TEST auto-created company:', driveError.message);
+                            }
+                        }
                     }
 
                     if (!company) throw new Error(`Company "${companyName}" not found. Please match an existing company or use "TEST".`);
@@ -1033,6 +1789,15 @@ router.post('/bulk-upload', authenticate, authorize(['SPOCAdmin']), (req, res, n
                 schedule.createdBy = req.user.id;
                 schedule.status = 'scheduled';
                 schedule.collegeLocation = collegesCache[collegeName].location;
+                const folderFields = await ensureScheduleDriveFolderFields({
+                    companyId: schedule.companyId || null,
+                    courseId: schedule.courseId || null,
+                    collegeId: schedule.collegeId,
+                    departmentId: schedule.departmentId || null,
+                    dayNumber: schedule.dayNumber,
+                    fallbackFields: schedule.toObject(),
+                });
+                Object.assign(schedule, folderFields);
 
                 await schedule.save();
                 

@@ -7,6 +7,8 @@
     "start": "node server.mjs",
     "dev": "nodemon server.mjs",
     "seed": "node scripts/seed-channels.js",
+    "drive:smoke": "node scripts/drive-smoke-test.js",
+    "drive:audit": "node scripts/drive-audit.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -35,6 +37,7 @@
     "haversine-distance": "^1.2.4",
     "ics": "^3.8.1",
     "ioredis": "^5.10.0",
+    "jpeg-exif": "^1.1.4",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.0.0",
     "multer": "^2.0.2",

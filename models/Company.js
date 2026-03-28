@@ -88,6 +88,18 @@ const companySchema = new mongoose.Schema({
         ref: 'User',
         default: null,
     },
+    driveFolderId: {
+        type: String,
+        default: null,
+    },
+    driveFolderName: {
+        type: String,
+        default: null,
+    },
+    driveFolderLink: {
+        type: String,
+        default: null,
+    },
 }, {
     timestamps: true,
 });
@@ -105,6 +117,9 @@ companySchema.pre('validate', async function (next) {
 
 companySchema.statics.generateCompanyCode = generateCompanyCode;
 companySchema.statics.createUniqueCompanyCode = createUniqueCompanyCode;
+
+companySchema.index({ name: 1 });
+companySchema.index({ driveFolderId: 1 }, { sparse: true });
 
 companySchema.pre('save', function (next) {
     // Keep adminId and legacy userId in sync

@@ -69,6 +69,12 @@ const chatMessageSchema = new mongoose.Schema(
       type: Number,
       default: null,
     },
+    tempId: {
+      type: String,
+      trim: true,
+      default: null,
+      index: true,
+    },
     duration: {
       type: Number,
       default: null,

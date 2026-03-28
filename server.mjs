@@ -107,12 +107,17 @@ app.use((req, res, next) => {
 });
 
 // Static Files
-app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
+const uploadsDir = path.join(__dirname, 'uploads');
+const uploadsStaticOptions = {
   maxAge: '1y',
   setHeaders: (res) => {
     res.setHeader('Cache-Control', 'public, max-age=31536000');
   }
-}));
+};
+
+app.use('/uploads', express.static(uploadsDir, uploadsStaticOptions));
+// Backward-compatible alias for clients using API base URL + file path.
+app.use('/api/uploads', express.static(uploadsDir, uploadsStaticOptions));
 
 // Routes
 app.use("/api", routes);

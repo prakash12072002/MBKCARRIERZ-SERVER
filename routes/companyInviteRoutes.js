@@ -6,6 +6,10 @@ const { CompanyInvite, Otp, Company, User, CompanyArchive } = require("../models
 const { sendMail } = require("../utils/emailService");
 const inviteEmailTemplate = require("../utils/inviteEmailTemplate");
 const companyActivatedEmail = require("../utils/companyActivatedEmail");
+const {
+  ensureCompanyHierarchy,
+  isTrainingDriveEnabled,
+} = require("../services/googleDriveTrainingHierarchyService");
 
 const router = express.Router();
 
@@ -204,6 +208,21 @@ router.post("/complete", upload.single("logo"), async (req, res) => {
       status: "active",
       ...(req.file?.path ? { logo: req.file.path } : {}),
     });
+    if (isTrainingDriveEnabled()) {
+      try {
+        const hierarchy = await ensureCompanyHierarchy({ company });
+        if (hierarchy?.companyFolder?.id) {
+          company.driveFolderId = hierarchy.companyFolder.id;
+          company.driveFolderName = hierarchy.companyFolder.name;
+          company.driveFolderLink = hierarchy.companyFolder.link;
+        }
+      } catch (driveError) {
+        console.error(
+          "[GOOGLE-DRIVE] Failed to create company folder during invite completion:",
+          driveError.message,
+        );
+      }
+    }
 
     let user = existingUser;
 

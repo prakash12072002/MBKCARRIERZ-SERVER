@@ -23,6 +23,8 @@ const studentRoutes = require("./studentRoutes.js");
 const companyPortalRoutes = require("./companyPortalRoutes.js");
 const companyInviteRoutes = require("./companyInviteRoutes.js");
 const departmentRoutes = require("./departmentRoutes.js");
+const driveHierarchyRoutes = require("./driveHierarchyRoutes.js");
+const trainingPlatformRoutes = require("./trainingPlatformRoutes.js");
 const captchaRoute = require("./captchaRoute.js");
 import chatRoutes from "./chatRoutes.mjs";
 import messageRoutes from "./messageRoutes.mjs";
@@ -48,6 +50,11 @@ router.use("/colleges", collegeRoutes);
 router.use("/courses", courseRoutes);
 router.use("/trainers", trainerRoutes);
 router.use("/schedules", scheduleRoutes);
+router.post(
+  "/upload-image",
+  attendanceRoutes.uploadSingleGeoImageMiddleware,
+  attendanceRoutes.uploadSingleGeoImageHandler,
+);
 router.use("/attendance", attendanceRoutes);
 router.use("/trainer-attendance", trainerAttendanceRoutes);
 router.use("/trainer-documents", trainerDocumentRoutes);
@@ -59,6 +66,8 @@ router.use("/complaints", complaintRoutes);
 router.use("/notifications", notificationRoutes);
 router.use("/company-portal", companyPortalRoutes);
 router.use("/departments", departmentRoutes);
+router.use("/drive-hierarchy", driveHierarchyRoutes);
+router.use("/training-platform", trainingPlatformRoutes);
 router.use("/admin/trainers", adminTrainerRoutes);
 router.use("/chat", authenticate, chatRoutes);
 router.use("/message", messageRoutes);

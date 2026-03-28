@@ -4,6 +4,12 @@ const { College, Trainer, User } = require('../models');
 const { authenticate, authorize } = require('../middleware/auth');
 const { cascadeDeleteCollegesByIds } = require('../services/hierarchyDeleteService');
 const {
+    ensureCollegeHierarchy,
+    ensureDepartmentHierarchy,
+    isTrainingDriveEnabled,
+    toDepartmentDayFolders,
+} = require('../services/googleDriveTrainingHierarchyService');
+const {
     normalizeRole,
     canAccessCollegeByCompany,
     parseDepartments,
@@ -73,8 +79,90 @@ const hasViewPermission = (permissions = []) => {
     return normalized.includes('view') || normalized.includes('*') || normalized.includes('all');
 };
 
+const hasAttendanceDocs = (attendance) =>
+    Boolean(attendance?.attendancePdfUrl || attendance?.attendanceExcelUrl);
+
+const hasGeoTagDocs = (attendance) =>
+    Boolean(
+        attendance?.signatureUrl
+        || attendance?.studentsPhotoUrl
+        || attendance?.checkOutGeoImageUrl
+        || (Array.isArray(attendance?.checkOutGeoImageUrls) && attendance.checkOutGeoImageUrls.length)
+        || (Array.isArray(attendance?.activityPhotos) && attendance.activityPhotos.length)
+        || (Array.isArray(attendance?.activityVideos) && attendance.activityVideos.length)
+    );
+
+const buildDocsStatusLabel = (attendance) => hasAttendanceDocs(attendance) ? 'Docs Uploaded' : 'Pending';
+
+const buildGeoStatusLabel = (attendance) => {
+    const normalized = String(attendance?.geoVerificationStatus || '').trim().toLowerCase();
+    if (normalized === 'approved') return 'Completed';
+    return 'Pending';
+};
+
+const normalizeDayStatus = (value) => {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'completed') return 'completed';
+    if (normalized === 'pending') return 'pending';
+    if (normalized === 'not_assigned') return 'not_assigned';
+    return null;
+};
+
+const buildDayUploadStatus = (schedule, attendance) => {
+    const attendanceUploaded = typeof schedule?.attendanceUploaded === 'boolean'
+        ? schedule.attendanceUploaded
+        : hasAttendanceDocs(attendance);
+    const geoTagUploaded = typeof schedule?.geoTagUploaded === 'boolean'
+        ? schedule.geoTagUploaded
+        : hasGeoTagDocs(attendance);
+    const persistedDayStatus = normalizeDayStatus(schedule?.dayStatus);
+    if (persistedDayStatus) {
+        return {
+            attendanceUploaded,
+            geoTagUploaded,
+            statusCode: persistedDayStatus,
+            statusLabel: persistedDayStatus === 'completed'
+                ? 'Completed'
+                : persistedDayStatus === 'pending'
+                    ? 'Pending'
+                    : 'Not Assigned',
+        };
+    }
+    const normalizedScheduleStatus = String(schedule?.status || '').trim().toLowerCase();
+    const hasTrainerAssigned = Boolean(schedule?.trainerId);
+    const attendanceVerified = String(attendance?.verificationStatus || '').trim().toLowerCase() === 'approved';
+    const geoVerified = String(attendance?.geoVerificationStatus || '').trim().toLowerCase() === 'approved';
+
+    if (!hasTrainerAssigned || normalizedScheduleStatus === 'cancelled') {
+        return {
+            attendanceUploaded,
+            geoTagUploaded,
+            statusCode: 'not_assigned',
+            statusLabel: 'Not Assigned',
+        };
+    }
+
+    if (attendanceUploaded && geoTagUploaded && attendanceVerified && geoVerified) {
+        return {
+            attendanceUploaded,
+            geoTagUploaded,
+            statusCode: 'completed',
+            statusLabel: 'Completed',
+        };
+    }
+
+    return {
+        attendanceUploaded,
+        geoTagUploaded,
+        statusCode: 'pending',
+        statusLabel: 'Pending',
+    };
+};
+
 const ensureDepartmentsAndSchedules = async (college, preferredDepartmentName = '') => {
     const { Department, Schedule } = require('../models');
+    const companyIdValue = college?.companyId?._id || college?.companyId || null;
+    const courseIdValue = college?.courseId?._id || college?.courseId || null;
     const departmentNames = parseDepartments(college?.department);
 
     if (preferredDepartmentName && !departmentNames.some((item) => normalizeText(item) === normalizeText(preferredDepartmentName))) {
@@ -90,8 +178,8 @@ const ensureDepartmentsAndSchedules = async (college, preferredDepartmentName = 
         .filter((name) => !existingMap.has(normalizeText(name)))
         .map((name) => ({
             name,
-            companyId: college.companyId || null,
-            courseId: college.courseId || null,
+            companyId: companyIdValue || null,
+            courseId: courseIdValue || null,
             collegeId: college._id,
             isActive: true,
         }));
@@ -114,6 +202,81 @@ const ensureDepartmentsAndSchedules = async (college, preferredDepartmentName = 
     const activeDepartment = departments.find((dep) => normalizeText(dep.name) === normalizeText(preferredDepartmentName))
         || departments[0];
 
+    const dayFoldersByDepartmentId = new Map();
+    if (isTrainingDriveEnabled()) {
+        try {
+            const { Company, Course } = require('../models');
+            const companyDoc = companyIdValue
+                ? await Company.findById(companyIdValue).select('name driveFolderId driveFolderName driveFolderLink')
+                : null;
+            const courseDoc = courseIdValue
+                ? await Course.findById(courseIdValue).select('title driveFolderId driveFolderName driveFolderLink')
+                : null;
+
+            const collegeHierarchy = await ensureCollegeHierarchy({
+                company: companyDoc || { _id: companyIdValue, name: `Company_${companyIdValue}` },
+                course: courseDoc || null,
+                college,
+            });
+
+            if (collegeHierarchy?.companyFolder?.id && companyDoc && companyDoc.driveFolderId !== collegeHierarchy.companyFolder.id) {
+                companyDoc.driveFolderId = collegeHierarchy.companyFolder.id;
+                companyDoc.driveFolderName = collegeHierarchy.companyFolder.name;
+                companyDoc.driveFolderLink = collegeHierarchy.companyFolder.link;
+                await companyDoc.save();
+            }
+
+            if (collegeHierarchy?.courseFolder?.id && courseDoc && courseDoc.driveFolderId !== collegeHierarchy.courseFolder.id) {
+                courseDoc.driveFolderId = collegeHierarchy.courseFolder.id;
+                courseDoc.driveFolderName = collegeHierarchy.courseFolder.name;
+                courseDoc.driveFolderLink = collegeHierarchy.courseFolder.link;
+                await courseDoc.save();
+            }
+
+            if (collegeHierarchy?.collegeFolder?.id && college.driveFolderId !== collegeHierarchy.collegeFolder.id) {
+                college.driveFolderId = collegeHierarchy.collegeFolder.id;
+                college.driveFolderName = collegeHierarchy.collegeFolder.name;
+                college.driveFolderLink = collegeHierarchy.collegeFolder.link;
+                await college.save();
+            }
+
+            for (const department of departments) {
+                const departmentHierarchy = await ensureDepartmentHierarchy({
+                    company: companyDoc || { _id: companyIdValue, name: `Company_${companyIdValue}` },
+                    course: courseDoc || null,
+                    college,
+                    department,
+                    totalDays: 12,
+                });
+
+                let shouldSaveDepartment = false;
+                if (departmentHierarchy?.departmentFolder?.id && department.driveFolderId !== departmentHierarchy.departmentFolder.id) {
+                    department.driveFolderId = departmentHierarchy.departmentFolder.id;
+                    department.driveFolderName = departmentHierarchy.departmentFolder.name;
+                    department.driveFolderLink = departmentHierarchy.departmentFolder.link;
+                    shouldSaveDepartment = true;
+                }
+
+                const dayFolders = toDepartmentDayFolders(departmentHierarchy?.dayFoldersByDayNumber || {});
+                if (dayFolders.length) {
+                    department.dayFolders = dayFolders;
+                    shouldSaveDepartment = true;
+                }
+
+                if (shouldSaveDepartment) {
+                    await department.save();
+                }
+
+                dayFoldersByDepartmentId.set(
+                    String(department._id),
+                    departmentHierarchy?.dayFoldersByDayNumber || {}
+                );
+            }
+        } catch (driveError) {
+            console.error('[GOOGLE-DRIVE] Failed to sync college department/day folders:', driveError.message);
+        }
+    }
+
     // Backward compatibility: if college has only one department, attach legacy schedules.
     if (departments.length === 1) {
         await Schedule.updateMany(
@@ -128,7 +291,7 @@ const ensureDepartmentsAndSchedules = async (college, preferredDepartmentName = 
     const existingDepartmentSchedules = await Schedule.find({
         collegeId: college._id,
         departmentId: { $in: departments.map((dep) => dep._id) },
-    }).select('departmentId dayNumber');
+    }).select('_id departmentId dayNumber dayFolderId dayFolderName dayFolderLink attendanceFolderId geoTagFolderId driveFolderId driveFolderName driveFolderLink');
 
     const existingDayKeys = new Set(
         existingDepartmentSchedules.map((item) => `${String(item.departmentId)}-${item.dayNumber}`)
@@ -139,17 +302,30 @@ const ensureDepartmentsAndSchedules = async (college, preferredDepartmentName = 
         for (let day = 1; day <= 12; day++) {
             const key = `${String(department._id)}-${day}`;
             if (existingDayKeys.has(key)) continue;
+            const dayFolder = dayFoldersByDepartmentId.get(String(department._id))?.[day] || null;
 
             missingSchedules.push({
                 dayNumber: day,
                 collegeId: college._id,
                 departmentId: department._id,
-                companyId: college.companyId || null,
-                courseId: college.courseId || null,
+                companyId: companyIdValue || null,
+                courseId: courseIdValue || null,
                 status: 'scheduled',
                 startTime: '09:00',
                 endTime: '17:00',
                 subject: `Day ${day} Content`,
+                dayFolderId: dayFolder?.id || null,
+                dayFolderName: dayFolder?.name || null,
+                dayFolderLink: dayFolder?.link || null,
+                attendanceFolderId: dayFolder?.attendanceFolder?.id || null,
+                attendanceFolderName: dayFolder?.attendanceFolder?.name || null,
+                attendanceFolderLink: dayFolder?.attendanceFolder?.link || null,
+                geoTagFolderId: dayFolder?.geoTagFolder?.id || null,
+                geoTagFolderName: dayFolder?.geoTagFolder?.name || null,
+                geoTagFolderLink: dayFolder?.geoTagFolder?.link || null,
+                driveFolderId: dayFolder?.id || null,
+                driveFolderName: dayFolder?.name || null,
+                driveFolderLink: dayFolder?.link || null,
             });
         }
     });
@@ -160,6 +336,55 @@ const ensureDepartmentsAndSchedules = async (college, preferredDepartmentName = 
         } catch (error) {
             if (error?.code !== 11000 && error?.name !== 'BulkWriteError') {
                 throw error;
+            }
+        }
+    }
+
+    if (dayFoldersByDepartmentId.size) {
+        const scheduleFolderUpdates = [];
+        existingDepartmentSchedules.forEach((schedule) => {
+            const dayFolder = dayFoldersByDepartmentId.get(String(schedule.departmentId))?.[schedule.dayNumber] || null;
+            if (!dayFolder?.id) return;
+
+            if (
+                schedule.dayFolderId !== dayFolder.id ||
+                schedule.dayFolderName !== dayFolder.name ||
+                schedule.dayFolderLink !== dayFolder.link ||
+                schedule.attendanceFolderId !== (dayFolder?.attendanceFolder?.id || null) ||
+                schedule.geoTagFolderId !== (dayFolder?.geoTagFolder?.id || null) ||
+                schedule.driveFolderId !== dayFolder.id ||
+                schedule.driveFolderName !== dayFolder.name ||
+                schedule.driveFolderLink !== dayFolder.link
+            ) {
+                scheduleFolderUpdates.push({
+                    updateOne: {
+                        filter: { _id: schedule._id },
+                        update: {
+                            $set: {
+                                dayFolderId: dayFolder.id,
+                                dayFolderName: dayFolder.name,
+                                dayFolderLink: dayFolder.link,
+                                attendanceFolderId: dayFolder?.attendanceFolder?.id || null,
+                                attendanceFolderName: dayFolder?.attendanceFolder?.name || null,
+                                attendanceFolderLink: dayFolder?.attendanceFolder?.link || null,
+                                geoTagFolderId: dayFolder?.geoTagFolder?.id || null,
+                                geoTagFolderName: dayFolder?.geoTagFolder?.name || null,
+                                geoTagFolderLink: dayFolder?.geoTagFolder?.link || null,
+                                driveFolderId: dayFolder.id,
+                                driveFolderName: dayFolder.name,
+                                driveFolderLink: dayFolder.link,
+                            },
+                        },
+                    },
+                });
+            }
+        });
+
+        if (scheduleFolderUpdates.length) {
+            try {
+                await Schedule.bulkWrite(scheduleFolderUpdates, { ordered: false });
+            } catch (error) {
+                console.error('[GOOGLE-DRIVE] Failed to backfill day folder metadata on schedules:', error.message);
             }
         }
     }
@@ -292,7 +517,7 @@ router.get('/:id/details', authenticate, async (req, res) => {
         // Fetch attendance for each schedule
         const schedulesWithAttendance = await Promise.all(
             schedules.map(async (schedule) => {
-                // Find attendance by scheduleId OR by (collegeId + dayNumber) as fallback
+                // Strict mapping by scheduleId to avoid cross-day or cross-department mismatches.
                 let attendance = await Attendance.findOne({ scheduleId: schedule._id })
                     .sort({ createdAt: -1 })
                     .populate({
@@ -303,38 +528,31 @@ router.get('/:id/details', authenticate, async (req, res) => {
                         }
                     });
 
-                if (!attendance && !schedule.departmentId) {
-                    attendance = await Attendance.findOne({
-                        collegeId: college._id,
-                        dayNumber: schedule.dayNumber
-                    }).sort({ createdAt: -1 })
-                        .populate({
-                            path: 'trainerId',
-                            populate: {
-                                path: 'userId',
-                                select: 'name profilePicture'
-                            }
-                        });
-                }
-
                 return { schedule, attendance };
             })
         );
 
         // Transform data to match frontend expectation
         const days = schedulesWithAttendance.map(({ schedule, attendance }) => {
-            let status = 'Pending';
-            if (attendance) {
-                status = attendance.status === 'Present' ? 'Completed' : 'Pending';
-            } else if (new Date(schedule.scheduledDate) < new Date()) {
-                status = 'Pending'; // Past date but no attendance
-            }
+            const dayUploadStatus = buildDayUploadStatus(schedule, attendance);
 
             return {
                 id: schedule._id,
                 dayNumber: schedule.dayNumber,
                 departmentId: schedule.departmentId || activeDepartment?._id || null,
                 departmentName: activeDepartment?.name || null,
+                driveFolderId: schedule.driveFolderId || schedule.dayFolderId || null,
+                driveFolderName: schedule.driveFolderName || schedule.dayFolderName || null,
+                driveFolderLink: schedule.driveFolderLink || schedule.dayFolderLink || null,
+                dayFolderId: schedule.dayFolderId || schedule.driveFolderId || null,
+                dayFolderName: schedule.dayFolderName || schedule.driveFolderName || null,
+                dayFolderLink: schedule.dayFolderLink || schedule.driveFolderLink || null,
+                attendanceFolderId: schedule.attendanceFolderId || null,
+                attendanceFolderName: schedule.attendanceFolderName || null,
+                attendanceFolderLink: schedule.attendanceFolderLink || null,
+                geoTagFolderId: schedule.geoTagFolderId || null,
+                geoTagFolderName: schedule.geoTagFolderName || null,
+                geoTagFolderLink: schedule.geoTagFolderLink || null,
                 trainerName: schedule.trainerId?.userId?.name || attendance?.trainerId?.userId?.name || 'Unknown',
                 trainerPhone: schedule.trainerId?.phone || attendance?.trainerId?.phone || 'N/A',
                 trainerId: schedule.trainerId?._id || attendance?.trainerId?._id, // Needed for manual attendance creation
@@ -343,9 +561,16 @@ router.get('/:id/details', authenticate, async (req, res) => {
                 syllabusName: attendance?.syllabus || schedule.subject || `Day ${schedule.dayNumber} Content`,
                 date: schedule.scheduledDate,
                 time: `${schedule.startTime} - ${schedule.endTime}`,
-                status: status,
+                status: dayUploadStatus.statusLabel,
+                statusCode: dayUploadStatus.statusCode,
+                attendanceUploaded: dayUploadStatus.attendanceUploaded,
+                geoTagUploaded: dayUploadStatus.geoTagUploaded,
                 verificationStatus: attendance ? attendance.verificationStatus : 'Pending',
                 geoVerificationStatus: attendance ? attendance.geoVerificationStatus : 'pending',
+                hasAttendanceDocs: hasAttendanceDocs(attendance),
+                hasGeoTagDocs: hasGeoTagDocs(attendance),
+                docsStatusLabel: buildDocsStatusLabel(attendance),
+                geoStatusLabel: buildGeoStatusLabel(attendance),
                 approvedBy: attendance ? attendance.approvedBy : null,
                 collegeSpoc: college.spocName || college.principalName || 'N/A',
                 companySpoc: 'Company SPOC', // Placeholder
@@ -466,7 +691,7 @@ router.post('/', authenticate, isSPOCAdmin, async (req, res) => {
             courseId
         } = req.body;
 
-        const { Company, Course } = require('../models');
+        const { Company, Course, Schedule } = require('../models');
 
         let company;
         // If companyId is provided (e.g. by SuperAdmin), use it
@@ -545,14 +770,15 @@ router.post('/', authenticate, isSPOCAdmin, async (req, res) => {
 
 
         // If courseId is provided, link college to course (keep this for backward compatibility/other lookups)
+        let courseDoc = null;
         if (courseId) {
-            const course = await Course.findById(courseId);
-            if (course) {
+            courseDoc = await Course.findById(courseId);
+            if (courseDoc) {
                 // Add college to course's colleges array if not already there
-                const isLinked = course.colleges.some(id => id.toString() === college._id.toString());
+                const isLinked = courseDoc.colleges.some(id => id.toString() === college._id.toString());
                 if (!isLinked) {
-                    course.colleges.push(college._id);
-                    await course.save();
+                    courseDoc.colleges.push(college._id);
+                    await courseDoc.save();
                 }
             } else {
                 console.warn('Course not found:', courseId);
@@ -560,7 +786,125 @@ router.post('/', authenticate, isSPOCAdmin, async (req, res) => {
         }
 
         // Auto-generate Department tree and fixed 12 days per department.
-        await ensureDepartmentsAndSchedules(college);
+        const { departments } = await ensureDepartmentsAndSchedules(college);
+
+        if (isTrainingDriveEnabled()) {
+            try {
+                const hierarchy = await ensureCollegeHierarchy({
+                    company,
+                    course: courseDoc,
+                    college,
+                });
+
+                if (hierarchy?.companyFolder?.id && company.driveFolderId !== hierarchy.companyFolder.id) {
+                    company.driveFolderId = hierarchy.companyFolder.id;
+                    company.driveFolderName = hierarchy.companyFolder.name;
+                    company.driveFolderLink = hierarchy.companyFolder.link;
+                    await company.save();
+                }
+
+                if (courseDoc && hierarchy?.courseFolder?.id && courseDoc.driveFolderId !== hierarchy.courseFolder.id) {
+                    courseDoc.driveFolderId = hierarchy.courseFolder.id;
+                    courseDoc.driveFolderName = hierarchy.courseFolder.name;
+                    courseDoc.driveFolderLink = hierarchy.courseFolder.link;
+                    await courseDoc.save();
+                }
+
+                if (hierarchy?.collegeFolder?.id && college.driveFolderId !== hierarchy.collegeFolder.id) {
+                    college.driveFolderId = hierarchy.collegeFolder.id;
+                    college.driveFolderName = hierarchy.collegeFolder.name;
+                    college.driveFolderLink = hierarchy.collegeFolder.link;
+                    await college.save();
+                }
+
+                const departmentIds = departments.map((dep) => dep._id);
+                const daySchedules = departmentIds.length
+                    ? await Schedule.find({
+                        collegeId: college._id,
+                        departmentId: { $in: departmentIds },
+                        dayNumber: { $gte: 1, $lte: 12 },
+                    }).select('_id departmentId dayNumber dayFolderId dayFolderName dayFolderLink attendanceFolderId geoTagFolderId driveFolderId driveFolderName driveFolderLink')
+                    : [];
+
+                const scheduleByDepDay = new Map(
+                    daySchedules.map((row) => [`${String(row.departmentId)}-${row.dayNumber}`, row])
+                );
+
+                const scheduleUpdates = [];
+                for (const dep of departments) {
+                    const departmentHierarchy = await ensureDepartmentHierarchy({
+                        company,
+                        course: courseDoc,
+                        college,
+                        department: dep,
+                        totalDays: 12,
+                    });
+
+                    let shouldSaveDepartment = false;
+                    if (departmentHierarchy?.departmentFolder?.id && dep.driveFolderId !== departmentHierarchy.departmentFolder.id) {
+                        dep.driveFolderId = departmentHierarchy.departmentFolder.id;
+                        dep.driveFolderName = departmentHierarchy.departmentFolder.name;
+                        dep.driveFolderLink = departmentHierarchy.departmentFolder.link;
+                        shouldSaveDepartment = true;
+                    }
+
+                    const dayFolders = toDepartmentDayFolders(departmentHierarchy?.dayFoldersByDayNumber || {});
+                    if (dayFolders.length) {
+                        dep.dayFolders = dayFolders;
+                        shouldSaveDepartment = true;
+                    }
+
+                    if (shouldSaveDepartment) {
+                        await dep.save();
+                    }
+
+                    for (let dayNumber = 1; dayNumber <= 12; dayNumber += 1) {
+                        const dayFolder = departmentHierarchy?.dayFoldersByDayNumber?.[dayNumber];
+                        const schedule = scheduleByDepDay.get(`${String(dep._id)}-${dayNumber}`);
+                        if (!schedule || !dayFolder?.id) continue;
+
+                        if (
+                            schedule.dayFolderId !== dayFolder.id ||
+                            schedule.dayFolderName !== dayFolder.name ||
+                            schedule.dayFolderLink !== dayFolder.link ||
+                            schedule.attendanceFolderId !== (dayFolder?.attendanceFolder?.id || null) ||
+                            schedule.geoTagFolderId !== (dayFolder?.geoTagFolder?.id || null) ||
+                            schedule.driveFolderId !== dayFolder.id ||
+                            schedule.driveFolderName !== dayFolder.name ||
+                            schedule.driveFolderLink !== dayFolder.link
+                        ) {
+                            scheduleUpdates.push({
+                                updateOne: {
+                                    filter: { _id: schedule._id },
+                                    update: {
+                                        $set: {
+                                            dayFolderId: dayFolder.id,
+                                            dayFolderName: dayFolder.name,
+                                            dayFolderLink: dayFolder.link,
+                                            attendanceFolderId: dayFolder?.attendanceFolder?.id || null,
+                                            attendanceFolderName: dayFolder?.attendanceFolder?.name || null,
+                                            attendanceFolderLink: dayFolder?.attendanceFolder?.link || null,
+                                            geoTagFolderId: dayFolder?.geoTagFolder?.id || null,
+                                            geoTagFolderName: dayFolder?.geoTagFolder?.name || null,
+                                            geoTagFolderLink: dayFolder?.geoTagFolder?.link || null,
+                                            driveFolderId: dayFolder.id,
+                                            driveFolderName: dayFolder.name,
+                                            driveFolderLink: dayFolder.link,
+                                        },
+                                    },
+                                },
+                            });
+                        }
+                    }
+                }
+
+                if (scheduleUpdates.length) {
+                    await Schedule.bulkWrite(scheduleUpdates, { ordered: false });
+                }
+            } catch (driveError) {
+                console.error('[GOOGLE-DRIVE] Failed to create college/department/day hierarchy:', driveError.message);
+            }
+        }
 
         res.status(201).json(college);
     } catch (error) {

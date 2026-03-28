@@ -6,6 +6,10 @@ const { upload } = require('../config/cloudinary');
 const crypto = require('crypto');
 const { sendMail, sendCompanyAdminWelcomeEmail } = require('../utils/emailService');
 const { cascadeDeleteCompanyHierarchy } = require('../services/hierarchyDeleteService');
+const {
+    ensureCompanyHierarchy,
+    isTrainingDriveEnabled,
+} = require('../services/googleDriveTrainingHierarchyService');
 const isCompanyAdminRole = (role) => ['CompanyAdmin', 'companyadmin'].includes(String(role || ''));
 
 // @route   POST /api/companies/send-otp
@@ -240,6 +244,20 @@ router.put('/:code', authenticate, upload.single('logo'), async (req, res) => {
         }
         
         await company.save();
+
+        if (isTrainingDriveEnabled()) {
+            try {
+                const hierarchy = await ensureCompanyHierarchy({ company });
+                if (hierarchy?.companyFolder?.id) {
+                    company.driveFolderId = hierarchy.companyFolder.id;
+                    company.driveFolderName = hierarchy.companyFolder.name;
+                    company.driveFolderLink = hierarchy.companyFolder.link;
+                    await company.save();
+                }
+            } catch (driveError) {
+                console.error('[GOOGLE-DRIVE] Failed to sync company hierarchy:', driveError.message);
+            }
+        }
 
         await CompanyArchive.create({
             companyId: company._id,

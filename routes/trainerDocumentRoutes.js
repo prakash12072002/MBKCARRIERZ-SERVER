@@ -16,11 +16,12 @@ const {
 } = require("../utils/emailService");
 const scanFile = require("../middleware/virusScan");
 const {
-  DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID,
-  ensureDriveFolder,
   uploadToDrive,
   deleteFromDrive,
 } = require("../services/googleDriveService");
+const {
+  ensureTrainerDocumentHierarchy,
+} = require("../services/googleDriveTrainerDocumentHierarchyService");
 const {
   REQUIRED_TRAINER_DOCUMENTS,
   evaluateTrainerDocumentWorkflow,
@@ -646,10 +647,13 @@ router.post(
         documentType: { $in: getTrainerDocumentTypeCandidates(normalizedDocType) },
       });
 
-      const trainerDriveFolder = await ensureDriveFolder({
-        parentFolderId: DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID,
-        folderName: trainer.trainerId,
+      const hierarchy = await ensureTrainerDocumentHierarchy({
+        trainer,
+        persistTrainer: false,
+        syncExistingDocuments: true,
       });
+      const trainerDriveFolder = hierarchy.trainerFolder;
+      const trainerDocumentsFolder = hierarchy.documentsFolder;
       trainer.driveFolderId = trainerDriveFolder.id;
       trainer.driveFolderName = trainerDriveFolder.name;
       const fixedDriveFileName = buildFixedTrainerDocumentFileName(
@@ -662,7 +666,7 @@ router.post(
         fileBuffer: req.file.buffer,
         mimeType: req.file.mimetype,
         originalName: req.file.originalname,
-        folderId: trainerDriveFolder.id,
+        folderId: trainerDocumentsFolder.id,
         fileName: fixedDriveFileName,
       });
 
@@ -678,8 +682,8 @@ router.post(
         driveFileId: driveUpload.fileId,
         driveViewLink: driveUpload.webViewLink,
         driveDownloadLink: driveUpload.downloadLink,
-        driveFolderId: trainerDriveFolder.id,
-        driveFolderName: trainerDriveFolder.name,
+        driveFolderId: trainerDocumentsFolder.id,
+        driveFolderName: trainerDocumentsFolder.name,
         fileSize: req.file.size,
         mimeType: req.file.mimetype,
         verificationStatus: "PENDING",

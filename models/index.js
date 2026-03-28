@@ -29,6 +29,7 @@ const City = require('./City');
 const RefreshToken = require('./RefreshToken');
 const ChatMessage = require('./ChatMessage');
 const Chat = require('./Chat');
+const ScheduleDocument = require('./ScheduleDocument');
 
 module.exports = {
   User,
@@ -61,5 +62,6 @@ module.exports = {
   City,
   RefreshToken,
   ChatMessage,
-  Chat
+  Chat,
+  ScheduleDocument
 };

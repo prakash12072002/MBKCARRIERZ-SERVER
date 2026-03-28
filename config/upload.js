@@ -2,6 +2,34 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 
+const ATTENDANCE_PDF_FIELDS = new Set(['attendancePdf']);
+const ATTENDANCE_EXCEL_FIELDS = new Set(['attendanceExcel']);
+const GEO_IMAGE_FIELDS = new Set([
+    'studentsPhoto',
+    'signature',
+    'photo',
+    'photos',
+    'image',
+    'images',
+    'checkOutGeoImage',
+    'activityPhotos',
+    'checkOutSignature'
+]);
+const GEO_VIDEO_FIELDS = new Set(['activityVideos']);
+
+const PDF_EXTENSIONS = new Set(['.pdf']);
+const EXCEL_EXTENSIONS = new Set(['.xls', '.xlsx']);
+const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png']);
+const VIDEO_EXTENSIONS = new Set(['.mp4']);
+
+const PDF_MIME_TYPES = new Set(['application/pdf']);
+const EXCEL_MIME_TYPES = new Set([
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.ms-excel'
+]);
+const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png']);
+const VIDEO_MIME_TYPES = new Set(['video/mp4']);
+
 // Ensure upload directories exist
 const uploadDir = './uploads/attendance';
 const imageDir = path.join(uploadDir, 'images');
@@ -9,8 +37,9 @@ const signatureDir = path.join(uploadDir, 'signatures');
 const pdfDir = path.join(uploadDir, 'pdfs');
 const videoDir = path.join(uploadDir, 'videos');
 const photoDir = path.join(uploadDir, 'photos');
+const excelDir = path.join(uploadDir, 'excels');
 
-[uploadDir, imageDir, signatureDir, pdfDir, videoDir, photoDir].forEach(dir => {
+[uploadDir, imageDir, signatureDir, pdfDir, videoDir, photoDir, excelDir].forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
     }
@@ -43,6 +72,7 @@ const multiStorage = multer.diskStorage({
     destination: (req, file, cb) => {
         let dir = uploadDir;
         if (file.fieldname === 'attendancePdf') dir = pdfDir;
+        else if (file.fieldname === 'attendanceExcel') dir = excelDir;
         else if (file.fieldname === 'studentsPhoto') dir = photoDir;
         else if (file.fieldname === 'signature') dir = signatureDir;
         else if (file.fieldname === 'activityPhotos') dir = photoDir;
@@ -57,24 +87,65 @@ const multiStorage = multer.diskStorage({
     }
 });
 
-// File filter - allow images, PDFs, and videos
-const fileFilter = (req, file, cb) => {
-    const allowedImageTypes = /jpeg|jpg|png|gif/;
-    const allowedPdfTypes = /pdf/;
-    const allowedVideoTypes = /mp4|avi|mov|wmv/;
+const fileMatchesAllowedType = (file, allowedExtensions, allowedMimeTypes) => {
+    const extname = path.extname(file.originalname || '').toLowerCase();
+    const mimetype = String(file.mimetype || '').toLowerCase();
+    return allowedExtensions.has(extname) || allowedMimeTypes.has(mimetype);
+};
 
-    const extname = path.extname(file.originalname).toLowerCase();
-    const basename = path.basename(extname);
-
-    if (allowedImageTypes.test(extname) || allowedImageTypes.test(file.mimetype)) {
-        cb(null, true);
-    } else if (allowedPdfTypes.test(extname) || file.mimetype === 'application/pdf') {
-        cb(null, true);
-    } else if (allowedVideoTypes.test(extname) || file.mimetype.startsWith('video/')) {
-        cb(null, true);
-    } else {
-        cb(new Error('Only image, PDF, and video files are allowed'));
+const resolveAllowedTypeForField = (fieldName = '') => {
+    if (ATTENDANCE_PDF_FIELDS.has(fieldName)) {
+        return {
+            label: 'Attendance PDF',
+            allowedExtensions: PDF_EXTENSIONS,
+            allowedMimeTypes: PDF_MIME_TYPES
+        };
     }
+
+    if (ATTENDANCE_EXCEL_FIELDS.has(fieldName)) {
+        return {
+            label: 'Attendance Excel',
+            allowedExtensions: EXCEL_EXTENSIONS,
+            allowedMimeTypes: EXCEL_MIME_TYPES
+        };
+    }
+
+    if (GEO_IMAGE_FIELDS.has(fieldName)) {
+        return {
+            label: 'GeoTag image',
+            allowedExtensions: IMAGE_EXTENSIONS,
+            allowedMimeTypes: IMAGE_MIME_TYPES
+        };
+    }
+
+    if (GEO_VIDEO_FIELDS.has(fieldName)) {
+        return {
+            label: 'GeoTag video',
+            allowedExtensions: VIDEO_EXTENSIONS,
+            allowedMimeTypes: VIDEO_MIME_TYPES
+        };
+    }
+
+    return null;
+};
+
+// File filter - enforce types by field purpose
+const fileFilter = (req, file, cb) => {
+    const fieldRule = resolveAllowedTypeForField(file.fieldname);
+
+    if (!fieldRule) {
+        return cb(new Error(`Unsupported upload field: ${file.fieldname}`));
+    }
+
+    if (fileMatchesAllowedType(file, fieldRule.allowedExtensions, fieldRule.allowedMimeTypes)) {
+        return cb(null, true);
+    }
+
+    return cb(
+        new Error(
+            `${fieldRule.label} only allows ${Array.from(fieldRule.allowedExtensions).join(', ')} files`
+        )
+    );
 };
 
 // Upload middleware for attendance with image and signature (LEGACY)
@@ -90,6 +161,7 @@ const uploadAttendance = multer({
     }
 }).fields([
     { name: 'attendancePdf', maxCount: 1 },
+    { name: 'attendanceExcel', maxCount: 1 },
     { name: 'studentsPhoto', maxCount: 1 },
     { name: 'signature', maxCount: 1 },
     { name: 'photo', maxCount: 10 },        // Added plural/singular variations for robustness

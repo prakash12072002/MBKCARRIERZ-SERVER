@@ -22,11 +22,12 @@ const {
 const Notification = require("../models/Notification");
 const { generateNdaPdf } = require("../utils/generateNdaPdf");
 const {
-  DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID,
-  ensureDriveFolder,
   uploadToDrive,
   deleteFromDrive,
 } = require("../services/googleDriveService");
+const {
+  ensureTrainerDocumentHierarchy,
+} = require("../services/googleDriveTrainerDocumentHierarchyService");
 const {
   evaluateTrainerDocumentWorkflow,
   hasCompletedTrainerDetails,
@@ -46,9 +47,25 @@ const escapeRegex = (value = "") =>
 const NDA_DOCUMENT_TYPE = "ndaAgreement";
 const LEGACY_NDA_DOCUMENT_TYPES = ["ntaAgreement", "NDAAgreement"];
 const NDA_DRIVE_FILE_NAME = "NDA-Form.pdf";
+const PROFILE_PICTURE_MIME_EXTENSION_MAP = {
+  "image/jpeg": ".jpg",
+  "image/jpg": ".jpg",
+  "image/png": ".png",
+  "image/webp": ".webp",
+  "image/gif": ".gif",
+};
 
 const resolveGeneratedFilePath = (relativePath = "") =>
   path.join(__dirname, "..", String(relativePath || "").replace(/^\/+/, ""));
+
+const buildProfilePictureDriveFileName = (file = {}) => {
+  const extension =
+    PROFILE_PICTURE_MIME_EXTENSION_MAP[file.mimetype] ||
+    path.extname(file.originalname || "") ||
+    "";
+
+  return `ProfilePicture${extension}`;
+};
 
 const toPlainObject = (value) =>
   value?.toObject ? value.toObject() : { ...(value || {}) };
@@ -127,37 +144,12 @@ const getCurrentNdaTemplate = async () => {
 };
 
 const ensureTrainerDriveFolder = async (trainer) => {
-  if (!trainer) {
-    throw new Error("Trainer record is required.");
-  }
-
-  if (!DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID) {
-    throw new Error("Google Drive folder ID is required.");
-  }
-
-  if (!trainer.trainerId) {
-    await trainer.save();
-  }
-
-  if (!trainer.trainerId) {
-    throw new Error("Trainer ID could not be generated.");
-  }
-
-  const driveFolder = await ensureDriveFolder({
-    parentFolderId: DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID,
-    folderName: trainer.trainerId,
+  const hierarchy = await ensureTrainerDocumentHierarchy({
+    trainer,
+    persistTrainer: true,
   });
 
-  if (
-    trainer.driveFolderId !== driveFolder.id ||
-    trainer.driveFolderName !== driveFolder.name
-  ) {
-    trainer.driveFolderId = driveFolder.id;
-    trainer.driveFolderName = driveFolder.name;
-    await trainer.save();
-  }
-
-  return driveFolder;
+  return hierarchy.trainerFolder;
 };
 
 const syncTrainerNdaAgreementPdfToDrive = async (trainer) => {
@@ -165,7 +157,13 @@ const syncTrainerNdaAgreementPdfToDrive = async (trainer) => {
     throw new Error("Trainer record is required to generate the NDA PDF.");
   }
 
-  const trainerDriveFolder = await ensureTrainerDriveFolder(trainer);
+  const hierarchy = await ensureTrainerDocumentHierarchy({
+    trainer,
+    persistTrainer: true,
+    syncExistingDocuments: true,
+  });
+  const trainerDriveFolder = hierarchy.trainerFolder;
+  const trainerDocumentsFolder = hierarchy.documentsFolder;
   const ndaTemplate = await getCurrentNdaTemplate();
   const pdfPath = await generateNdaPdf(trainer, ndaTemplate);
   const pdfBuffer = await fs.readFile(resolveGeneratedFilePath(pdfPath));
@@ -180,7 +178,7 @@ const syncTrainerNdaAgreementPdfToDrive = async (trainer) => {
       fileBuffer: pdfBuffer,
       mimeType: "application/pdf",
       originalName: path.basename(pdfPath),
-      folderId: trainerDriveFolder.id,
+      folderId: trainerDocumentsFolder.id,
       fileName: NDA_DRIVE_FILE_NAME,
     });
 
@@ -205,8 +203,8 @@ const syncTrainerNdaAgreementPdfToDrive = async (trainer) => {
           driveFileId: driveUpload.fileId,
           driveViewLink: driveUpload.webViewLink,
           driveDownloadLink: driveUpload.downloadLink,
-          driveFolderId: trainerDriveFolder.id,
-          driveFolderName: trainerDriveFolder.name,
+          driveFolderId: trainerDocumentsFolder.id,
+          driveFolderName: trainerDocumentsFolder.name,
           fileSize: pdfBuffer.length,
           mimeType: "application/pdf",
           verificationStatus: existingNDADoc?.verificationStatus || "PENDING",
@@ -249,8 +247,8 @@ const syncTrainerNdaAgreementPdfToDrive = async (trainer) => {
   return {
     pdfPath,
     filePath: driveUpload.fileUrl,
-    driveFolderId: trainerDriveFolder.id,
-    driveFolderName: trainerDriveFolder.name,
+    driveFolderId: trainerDocumentsFolder.id,
+    driveFolderName: trainerDocumentsFolder.name,
   };
 };
 
@@ -1797,12 +1795,12 @@ router.post(
   authenticate,
   upload.single("file"),
   async (req, res) => {
-    const fs = require("fs");
+    const fsSync = require("fs");
     const path = require("path");
     const logFile = path.join(__dirname, "../access_debug.log");
     const log = (msg) => {
       try {
-        fs.appendFileSync(
+        fsSync.appendFileSync(
           logFile,
           `[UPLOAD] ${new Date().toISOString()} ${msg}\n`,
         );
@@ -1826,12 +1824,28 @@ router.post(
           filename: file.filename,
           originalname: file.originalname,
           path: file.path,
+          mimetype: file.mimetype,
           size: file.size,
         })}`,
       );
 
+      const allowedProfilePictureMimeTypes = new Set([
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/webp",
+        "image/gif",
+      ]);
+      if (!allowedProfilePictureMimeTypes.has(file.mimetype)) {
+        log(`ERROR: Invalid profile picture mime type: ${file.mimetype}`);
+        return res.status(400).json({
+          message:
+            "Invalid profile picture type. Only JPG, PNG, WEBP, and GIF are allowed.",
+        });
+      }
+
       // CRITICAL: Check if file exists immediately after multer processes it
-      const fileExistsNow = fs.existsSync(file.path);
+      const fileExistsNow = fsSync.existsSync(file.path);
       log(`File exists on disk immediately after upload: ${fileExistsNow}`);
 
       if (!fileExistsNow) {
@@ -1871,25 +1885,57 @@ router.post(
 
       log(`Trainer found: ${trainer._id}`);
 
-      const filePath = `/uploads/trainer-documents/${file.filename}`;
-      log(`Saving path to DB: ${filePath}`);
+      const hierarchy = await ensureTrainerDocumentHierarchy({
+        trainer,
+        persistTrainer: true,
+      });
+      const fileBuffer = await fs.readFile(file.path);
+      const driveUpload = await uploadToDrive({
+        fileBuffer,
+        mimeType: file.mimetype,
+        originalName: file.originalname,
+        folderId: hierarchy.documentsFolder.id,
+        fileName: buildProfilePictureDriveFileName(file),
+      });
 
-      trainer.profilePicture = filePath;
+      trainer.profilePicture = driveUpload.fileUrl;
       await trainer.save();
 
+      if (trainer.userId) {
+        await User.findByIdAndUpdate(trainer.userId, {
+          $set: { profilePicture: driveUpload.fileUrl },
+        });
+      }
+
       log("SUCCESS: Profile picture saved to database");
-      log(`Physical file location: ${file.path}`);
+      log(`Drive file id: ${driveUpload.fileId}`);
 
       res.json({
         success: true,
         message: "Profile picture uploaded successfully",
         data: {
-          profilePicture: filePath,
+          profilePicture: driveUpload.fileUrl,
+          driveFileId: driveUpload.fileId,
+          driveViewLink: driveUpload.webViewLink,
+          driveDownloadLink: driveUpload.downloadLink,
         },
       });
     } catch (error) {
       console.error("[UPLOAD] ERROR:", error);
       res.status(500).json({ message: "Server error", error: error.message });
+    } finally {
+      if (req.file?.path) {
+        try {
+          await fs.unlink(req.file.path);
+        } catch (cleanupError) {
+          if (cleanupError?.code !== "ENOENT") {
+            console.warn(
+              "[UPLOAD] Failed to clean up local profile picture temp file:",
+              cleanupError.message,
+            );
+          }
+        }
+      }
     }
   },
 );

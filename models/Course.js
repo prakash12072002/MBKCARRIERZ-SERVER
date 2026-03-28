@@ -35,6 +35,18 @@ const courseSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'College',
     }],
+    driveFolderId: {
+        type: String,
+        default: null,
+    },
+    driveFolderName: {
+        type: String,
+        default: null,
+    },
+    driveFolderLink: {
+        type: String,
+        default: null,
+    },
 }, {
     timestamps: true,
 });
@@ -50,6 +62,9 @@ courseSchema.pre('save', async function (next) {
         next(error);
     }
 });
+
+courseSchema.index({ companyId: 1, title: 1 });
+courseSchema.index({ driveFolderId: 1 }, { sparse: true });
 
 const Course = mongoose.model('Course', courseSchema);
 

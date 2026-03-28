@@ -1,9 +1,13 @@
 const express = require('express');
 const router = express.Router();
-const { Course } = require('../models');
+const { Course, Company } = require('../models');
 const { authenticate } = require('../middleware/auth');
 const upload = require('../middleware/upload');
 const { cascadeDeleteCoursesByIds } = require('../services/hierarchyDeleteService');
+const {
+    ensureCourseHierarchy,
+    isTrainingDriveEnabled,
+} = require('../services/googleDriveTrainingHierarchyService');
 
 // @route   GET /api/courses
 // @desc    Get all courses (optionally filtered by companyId)
@@ -37,6 +41,32 @@ router.post('/', authenticate, async (req, res) => {
             courseHead,
             description
         });
+
+        if (isTrainingDriveEnabled()) {
+            try {
+                const company = await Company.findById(course.companyId);
+                if (company) {
+                    const hierarchy = await ensureCourseHierarchy({ company, course });
+
+                    if (hierarchy?.companyFolder?.id) {
+                        company.driveFolderId = hierarchy.companyFolder.id;
+                        company.driveFolderName = hierarchy.companyFolder.name;
+                        company.driveFolderLink = hierarchy.companyFolder.link;
+                        await company.save();
+                    }
+
+                    if (hierarchy?.courseFolder?.id) {
+                        course.driveFolderId = hierarchy.courseFolder.id;
+                        course.driveFolderName = hierarchy.courseFolder.name;
+                        course.driveFolderLink = hierarchy.courseFolder.link;
+                        await course.save();
+                    }
+                }
+            } catch (driveError) {
+                console.error('[GOOGLE-DRIVE] Failed to create course hierarchy:', driveError.message);
+            }
+        }
+
         res.status(201).json(course);
     } catch (error) {
         console.error('Error creating course:', error);
@@ -55,6 +85,35 @@ router.put('/:id', authenticate, async (req, res) => {
         }
         Object.assign(course, req.body);
         await course.save();
+
+        if (isTrainingDriveEnabled()) {
+            try {
+                const company = course.companyId
+                    ? await Company.findById(course.companyId).select('name driveFolderId driveFolderName driveFolderLink')
+                    : null;
+
+                if (company) {
+                    const hierarchy = await ensureCourseHierarchy({ company, course });
+
+                    if (hierarchy?.companyFolder?.id) {
+                        company.driveFolderId = hierarchy.companyFolder.id;
+                        company.driveFolderName = hierarchy.companyFolder.name;
+                        company.driveFolderLink = hierarchy.companyFolder.link;
+                        await company.save();
+                    }
+
+                    if (hierarchy?.courseFolder?.id) {
+                        course.driveFolderId = hierarchy.courseFolder.id;
+                        course.driveFolderName = hierarchy.courseFolder.name;
+                        course.driveFolderLink = hierarchy.courseFolder.link;
+                        await course.save();
+                    }
+                }
+            } catch (driveError) {
+                console.error('[GOOGLE-DRIVE] Failed to sync course hierarchy:', driveError.message);
+            }
+        }
+
         res.json(course);
     } catch (error) {
         console.error('Error updating course:', error);

@@ -28,6 +28,10 @@ const {
   resolveTrainerRegistrationStatus,
   resolveTrainerResumeStep,
 } = require("../utils/trainerDocumentWorkflow");
+const {
+  ensureCompanyHierarchy,
+  isTrainingDriveEnabled,
+} = require("../services/googleDriveTrainingHierarchyService");
 
 const buildTrainerRegistrationState = async (trainer) => {
   if (!trainer?._id) {
@@ -1566,6 +1570,21 @@ router.post("/complete-company-onboarding", upload.single("logo"), async (req, r
     };
 
     const company = await Company.create(companyPayload);
+    if (isTrainingDriveEnabled()) {
+      try {
+        const hierarchy = await ensureCompanyHierarchy({ company });
+        if (hierarchy?.companyFolder?.id) {
+          company.driveFolderId = hierarchy.companyFolder.id;
+          company.driveFolderName = hierarchy.companyFolder.name;
+          company.driveFolderLink = hierarchy.companyFolder.link;
+        }
+      } catch (driveError) {
+        console.error(
+          "[GOOGLE-DRIVE] Failed to create company folder during onboarding:",
+          driveError.message,
+        );
+      }
+    }
 
     user.name = adminName;
     user.companyId = company._id;

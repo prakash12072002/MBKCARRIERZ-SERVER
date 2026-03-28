@@ -61,6 +61,7 @@ const toSocketPayload = (messageDoc) => {
     deletedForEveryoneBy: message.deletedForEveryoneBy
       ? String(message.deletedForEveryoneBy)
       : null,
+    tempId: message.tempId ? String(message.tempId) : null,
     createdAt: message.createdAt,
     updatedAt: message.updatedAt,
   };
@@ -108,6 +109,7 @@ const createAndDispatchMessage = async ({ io, senderId, payload = {} }) => {
   const fileName = payload.fileName ? String(payload.fileName).trim() : null;
   const fileSize = Number.isFinite(payload.fileSize) ? Number(payload.fileSize) : null;
   const duration = Number.isFinite(payload.duration) ? Number(payload.duration) : null;
+  const tempId = payload.tempId ? String(payload.tempId).trim() : null;
   const metadata = payload.metadata && typeof payload.metadata === "object" ? payload.metadata : {};
 
   try {
@@ -152,6 +154,7 @@ const createAndDispatchMessage = async ({ io, senderId, payload = {} }) => {
       fileName,
       fileSize,
       duration,
+      tempId,
       metadata,
       status: "sent",
     });

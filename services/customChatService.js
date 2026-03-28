@@ -91,6 +91,7 @@ const serializeMessage = (messageDoc) => {
   return {
     id: String(message._id || ""),
     _id: String(message._id || ""),
+    tempId: isDeleted ? null : (message.tempId ? String(message.tempId) : null),
     chatId: message.chatId ? String(message.chatId) : null,
     senderId: message.senderId ? String(message.senderId) : null,
     receiverId: message.receiverId ? String(message.receiverId) : null,

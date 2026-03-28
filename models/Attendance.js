@@ -25,6 +25,10 @@ const attendanceSchema = new mongoose.Schema({
         type: Number,
         default: null,
     },
+    assignedDate: {
+        type: String,
+        default: null,
+    },
     area: {
         type: String,
         default: null, // For SPOC filtering (e.g., "North Zone")
@@ -74,6 +78,10 @@ const attendanceSchema = new mongoose.Schema({
         default: null,
     },
     verificationComment: {
+        type: String,
+        default: null,
+    },
+    geoValidationComment: {
         type: String,
         default: null,
     },
@@ -132,6 +140,11 @@ const attendanceSchema = new mongoose.Schema({
     },
     checkOut: {
         time: { type: Date, default: null },
+        finalStatus: {
+            type: String,
+            enum: ['COMPLETED', 'PENDING'],
+            default: 'PENDING',
+        },
         location: {
             lat: { type: Number, default: null },
             lng: { type: Number, default: null },
@@ -139,10 +152,47 @@ const attendanceSchema = new mongoose.Schema({
             address: { type: String, default: null },
             distanceFromCollege: { type: Number, default: null } // distance in meters
         },
+        images: [{
+            image: { type: String, default: null },
+            latitude: { type: Number, default: null },
+            longitude: { type: Number, default: null },
+            distance: { type: Number, default: null },
+            status: {
+                type: String,
+                enum: ['VERIFIED', 'PENDING'],
+                default: 'PENDING',
+            },
+        }],
         photos: [{
             url: { type: String, default: null },
-            uploadedAt: { type: Date, default: null }
+            uploadedAt: { type: Date, default: null },
+            validationStatus: {
+                type: String,
+                enum: ['verified', 'pending'],
+                default: 'pending',
+            },
+            validationReason: { type: String, default: null },
+            latitude: { type: Number, default: null },
+            longitude: { type: Number, default: null },
+            capturedAt: { type: Date, default: null },
+            distanceKm: { type: Number, default: null },
         }]
+    },
+    images: [{
+        image: { type: String, default: null },
+        latitude: { type: Number, default: null },
+        longitude: { type: Number, default: null },
+        distance: { type: Number, default: null },
+        status: {
+            type: String,
+            enum: ['VERIFIED', 'PENDING'],
+            default: 'PENDING',
+        },
+    }],
+    finalStatus: {
+        type: String,
+        enum: ['COMPLETED', 'PENDING'],
+        default: 'PENDING',
     },
     // Legacy fields
     imageUrl: {
@@ -205,9 +255,22 @@ const attendanceSchema = new mongoose.Schema({
         type: Date,
         default: null,
     },
+    driveFolderId: {
+        type: String,
+        default: null,
+    },
+    driveAssets: {
+        type: mongoose.Schema.Types.Mixed,
+        default: null,
+    },
 }, {
     timestamps: true,
 });
+
+attendanceSchema.index({ scheduleId: 1 });
+attendanceSchema.index({ trainerId: 1, date: -1 });
+attendanceSchema.index({ collegeId: 1, dayNumber: 1 });
+attendanceSchema.index({ driveFolderId: 1 }, { sparse: true });
 
 const Attendance = mongoose.model('Attendance', attendanceSchema);
 

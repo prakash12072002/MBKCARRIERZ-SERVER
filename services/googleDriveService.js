@@ -11,6 +11,15 @@ const MIME_EXTENSION_MAP = {
   "image/jpg": ".jpg",
   "image/png": ".png",
 };
+const EXTENSION_MIME_MAP = {
+  ".pdf": "application/pdf",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".mp4": "video/mp4",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+};
 const resolveDefaultDriveFolderId = () =>
   String(
     process.env.GOOGLE_DRIVE_FOLDER_ID ||
@@ -23,6 +32,13 @@ const DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID = resolveDefaultDriveFolderId();
 let driveClientPromise = null;
 const folderMetadataCache = new Map();
 const ensuredFolderCache = new Map();
+const clearDriveCaches = () => {
+  folderMetadataCache.clear();
+  ensuredFolderCache.clear();
+};
+
+const getFolderLink = (folderId) =>
+  folderId ? `https://drive.google.com/drive/folders/${folderId}` : null;
 
 const sanitizeFileName = (value = "document") =>
   String(value)
@@ -139,13 +155,59 @@ const resolveOAuthDriveConfig = () => {
   };
 };
 
+const resolveConfiguredDriveAuthMode = () =>
+  String(process.env.GOOGLE_DRIVE_AUTH_MODE || "")
+    .trim()
+    .toLowerCase();
+
+const tryResolveServiceAccountConfig = () => {
+  try {
+    return resolveServiceAccountConfig();
+  } catch (error) {
+    return null;
+  }
+};
+
 const resolveImpersonatedUserEmail = () =>
   String(process.env.GOOGLE_DRIVE_IMPERSONATE_USER_EMAIL || "")
     .trim()
     .toLowerCase();
 
 const resolveDriveAuthContext = () => {
+  const configuredMode = resolveConfiguredDriveAuthMode();
   const oauthConfig = resolveOAuthDriveConfig();
+  const serviceAccountConfig = tryResolveServiceAccountConfig();
+
+  if (configuredMode === "oauth2") {
+    if (!oauthConfig) {
+      throw new Error(
+        "GOOGLE_DRIVE_AUTH_MODE is oauth2 but OAuth credentials are missing. Set GOOGLE_DRIVE_CLIENT_ID, GOOGLE_DRIVE_CLIENT_SECRET, and GOOGLE_DRIVE_REFRESH_TOKEN.",
+      );
+    }
+    return {
+      authMode: "oauth2",
+      oauthConfig,
+    };
+  }
+
+  if (configuredMode === "service_account") {
+    const credentials = resolveServiceAccountConfig();
+    return {
+      authMode: "service_account",
+      credentials,
+      impersonatedUserEmail: resolveImpersonatedUserEmail(),
+    };
+  }
+
+  // Auto mode: prefer service account when available, fallback to OAuth.
+  if (serviceAccountConfig) {
+    return {
+      authMode: "service_account",
+      credentials: serviceAccountConfig,
+      impersonatedUserEmail: resolveImpersonatedUserEmail(),
+    };
+  }
+
   if (oauthConfig) {
     return {
       authMode: "oauth2",
@@ -153,12 +215,19 @@ const resolveDriveAuthContext = () => {
     };
   }
 
+  // Preserve existing explicit missing-credentials error
   const credentials = resolveServiceAccountConfig();
   return {
     authMode: "service_account",
     credentials,
     impersonatedUserEmail: resolveImpersonatedUserEmail(),
   };
+};
+
+const resolveServiceAccountEmail = () => {
+  const authContext = resolveDriveAuthContext();
+  if (authContext.authMode !== "service_account") return "";
+  return String(authContext.credentials?.client_email || "").trim();
 };
 
 const createDriveAuthClient = async (authContext) => {
@@ -212,11 +281,22 @@ const getFolderMetadata = async (drive, folderId) => {
     return folderMetadataCache.get(folderId);
   }
 
-  const response = await drive.files.get({
-    fileId: folderId,
-    fields: "id,name,mimeType,driveId",
-    supportsAllDrives: true,
-  });
+  let response;
+  try {
+    response = await drive.files.get({
+      fileId: folderId,
+      fields: "id,name,mimeType,driveId",
+      supportsAllDrives: true,
+    });
+  } catch (error) {
+    if (error?.code === 404) {
+      const serviceAccountEmail = resolveServiceAccountEmail();
+      throw new Error(
+        `Google Drive folder ${folderId} is not accessible. Confirm the folder ID is correct and share the folder with ${serviceAccountEmail || "the configured service account"} as Editor.`,
+      );
+    }
+    throw error;
+  }
 
   folderMetadataCache.set(folderId, response.data);
   return response.data;
@@ -237,23 +317,24 @@ const ensureDriveFolder = async ({
   }
 
   const drive = await getDriveClient();
-  const query = [
-    `mimeType = '${DRIVE_FOLDER_MIME_TYPE}'`,
-    `name = '${escapeDriveQueryValue(safeFolderName)}'`,
-    `'${parentFolderId}' in parents`,
-    "trashed = false",
-  ].join(" and ");
-
-  const existingFolders = await drive.files.list({
-    q: query,
-    fields: "files(id,name,webViewLink,driveId)",
-    pageSize: 1,
-    includeItemsFromAllDrives: true,
-    supportsAllDrives: true,
+  const existingFolders = await listDriveFoldersByName({
+    drive,
+    folderName: safeFolderName,
+    parentFolderId,
+    pageSize: 25,
   });
 
-  if (existingFolders.data.files?.length) {
-    const folder = existingFolders.data.files[0];
+  if (existingFolders.length) {
+    let folder = existingFolders[0];
+    if (existingFolders.length > 1) {
+      const cleanupResult = await mergeDuplicateDriveFolders({
+        drive,
+        parentFolderId,
+        folderName: safeFolderName,
+        keepFolderId: folder.id,
+      });
+      folder = cleanupResult.folder || folder;
+    }
     ensuredFolderCache.set(cacheKey, folder);
     return folder;
   }
@@ -270,6 +351,281 @@ const ensureDriveFolder = async ({
 
   ensuredFolderCache.set(cacheKey, createdFolder.data);
   return createdFolder.data;
+};
+
+const createFolder = async (name, parentId = DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID) =>
+  ensureDriveFolder({
+    folderName: name,
+    parentFolderId: parentId,
+  });
+
+const listDriveFoldersByName = async ({
+  drive,
+  folderName,
+  parentFolderId = DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID,
+  pageSize = 10,
+}) => {
+  if (!parentFolderId) {
+    throw new Error("Google Drive parent folder ID is required.");
+  }
+
+  const driveClient = drive || (await getDriveClient());
+  const safeFolderName = sanitizeFileName(folderName || "Folder");
+  const query = [
+    `mimeType = '${DRIVE_FOLDER_MIME_TYPE}'`,
+    `name = '${escapeDriveQueryValue(safeFolderName)}'`,
+    `'${parentFolderId}' in parents`,
+    "trashed = false",
+  ].join(" and ");
+
+  const response = await driveClient.files.list({
+    q: query,
+    fields: "files(id,name,webViewLink,driveId,parents,createdTime)",
+    pageSize,
+    includeItemsFromAllDrives: true,
+    supportsAllDrives: true,
+  });
+
+  return Array.isArray(response.data.files) ? response.data.files : [];
+};
+
+const findDriveFolder = async ({
+  folderName,
+  parentFolderId = DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID,
+}) => {
+  if (!parentFolderId) {
+    throw new Error("Google Drive parent folder ID is required.");
+  }
+
+  const existingFolders = await listDriveFoldersByName({
+    folderName,
+    parentFolderId,
+    pageSize: 1,
+  });
+
+  return existingFolders[0] || null;
+};
+
+const listDriveFolderChildren = async ({ drive, folderId }) => {
+  if (!folderId) return [];
+
+  const driveClient = drive || (await getDriveClient());
+  const items = [];
+  let pageToken = undefined;
+
+  do {
+    const response = await driveClient.files.list({
+      q: [`'${folderId}' in parents`, "trashed = false"].join(" and "),
+      fields: "nextPageToken,files(id,name,mimeType,parents,webViewLink,driveId)",
+      pageSize: 100,
+      pageToken,
+      includeItemsFromAllDrives: true,
+      supportsAllDrives: true,
+    });
+
+    items.push(...(Array.isArray(response.data.files) ? response.data.files : []));
+    pageToken = response.data.nextPageToken || undefined;
+  } while (pageToken);
+
+  return items;
+};
+
+const mergeDuplicateDriveFolders = async ({
+  drive,
+  parentFolderId = DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID,
+  folderName,
+  keepFolderId = null,
+}) => {
+  if (!parentFolderId) {
+    throw new Error("Google Drive parent folder ID is required.");
+  }
+
+  const driveClient = drive || (await getDriveClient());
+  const matches = await listDriveFoldersByName({
+    drive: driveClient,
+    folderName,
+    parentFolderId,
+    pageSize: 25,
+  });
+
+  if (!matches.length) {
+    return {
+      folder: null,
+      removedFolderIds: [],
+      movedItems: [],
+    };
+  }
+
+  const keepFolder =
+    (keepFolderId && matches.find((item) => item.id === keepFolderId)) || matches[0];
+  const duplicates = matches.filter((item) => item?.id && item.id !== keepFolder.id);
+  const movedItems = [];
+  const removedFolderIds = [];
+
+  for (const duplicate of duplicates) {
+    const children = await listDriveFolderChildren({
+      drive: driveClient,
+      folderId: duplicate.id,
+    });
+
+    for (const child of children) {
+      if (!child?.id) continue;
+      await moveDriveItemToParent({
+        itemId: child.id,
+        targetParentId: keepFolder.id,
+      });
+      movedItems.push({
+        itemId: child.id,
+        itemName: child.name || null,
+        fromFolderId: duplicate.id,
+        toFolderId: keepFolder.id,
+      });
+    }
+
+    await driveClient.files.delete({
+      fileId: duplicate.id,
+      supportsAllDrives: true,
+    });
+    removedFolderIds.push(duplicate.id);
+  }
+
+  if (duplicates.length) {
+    clearDriveCaches();
+  }
+
+  return {
+    folder: keepFolder,
+    removedFolderIds,
+    movedItems,
+  };
+};
+
+const cleanupDuplicateDriveFoldersByName = async ({
+  parentFolderId,
+  folderName,
+  keepFolderId = null,
+}) => {
+  const drive = await getDriveClient();
+  return mergeDuplicateDriveFolders({
+    drive,
+    parentFolderId,
+    folderName,
+    keepFolderId,
+  });
+};
+
+const moveDriveItemToParent = async ({ itemId, targetParentId }) => {
+  if (!itemId) {
+    throw new Error("Google Drive item ID is required.");
+  }
+  if (!targetParentId) {
+    throw new Error("Google Drive target parent folder ID is required.");
+  }
+
+  const drive = await getDriveClient();
+  const metadataResponse = await drive.files.get({
+    fileId: itemId,
+    fields: "id,name,webViewLink,parents,driveId",
+    supportsAllDrives: true,
+  });
+
+  const currentParents = Array.isArray(metadataResponse.data.parents)
+    ? metadataResponse.data.parents
+    : [];
+
+  const addParents = currentParents.includes(targetParentId)
+    ? undefined
+    : targetParentId;
+  const removeParents = currentParents
+    .filter((parentId) => parentId !== targetParentId)
+    .join(",");
+
+  if (!addParents && !removeParents) {
+    return metadataResponse.data;
+  }
+
+  const updatedResponse = await drive.files.update({
+    fileId: itemId,
+    addParents,
+    removeParents: removeParents || undefined,
+    fields: "id,name,webViewLink,driveId,parents",
+    supportsAllDrives: true,
+  });
+
+  clearDriveCaches();
+  return updatedResponse.data;
+};
+
+const syncDriveFolder = async ({
+  folderId,
+  folderName,
+  parentFolderId = DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID,
+}) => {
+  if (!parentFolderId) {
+    throw new Error("Google Drive parent folder ID is required.");
+  }
+
+  const safeFolderName = sanitizeFileName(folderName || "Folder");
+  if (!folderId) {
+    return ensureDriveFolder({
+      folderName: safeFolderName,
+      parentFolderId,
+    });
+  }
+
+  const drive = await getDriveClient();
+
+  let metadataResponse;
+  try {
+    metadataResponse = await drive.files.get({
+      fileId: folderId,
+      fields: "id,name,mimeType,webViewLink,parents,driveId",
+      supportsAllDrives: true,
+    });
+  } catch (error) {
+    if (error?.code === 404) {
+      clearDriveCaches();
+      return ensureDriveFolder({
+        folderName: safeFolderName,
+        parentFolderId,
+      });
+    }
+    throw error;
+  }
+
+  if (metadataResponse.data.mimeType !== DRIVE_FOLDER_MIME_TYPE) {
+    throw new Error(`Google Drive item ${folderId} is not a folder.`);
+  }
+
+  const currentParents = Array.isArray(metadataResponse.data.parents)
+    ? metadataResponse.data.parents
+    : [];
+  const addParents = currentParents.includes(parentFolderId)
+    ? undefined
+    : parentFolderId;
+  const removeParents = currentParents
+    .filter((parentId) => parentId !== parentFolderId)
+    .join(",");
+  const requestBody =
+    metadataResponse.data.name !== safeFolderName
+      ? { name: safeFolderName }
+      : undefined;
+
+  if (!requestBody && !addParents && !removeParents) {
+    return metadataResponse.data;
+  }
+
+  const updatedResponse = await drive.files.update({
+    fileId: folderId,
+    requestBody,
+    addParents,
+    removeParents: removeParents || undefined,
+    fields: "id,name,webViewLink,driveId,parents",
+    supportsAllDrives: true,
+  });
+
+  clearDriveCaches();
+  return updatedResponse.data;
 };
 
 const isStorageQuotaExceededError = (error) =>
@@ -308,6 +664,114 @@ const buildDriveUrls = (fileId) => ({
   downloadLink: `https://drive.google.com/uc?export=download&id=${fileId}`,
 });
 
+const waitForRetry = (delayMs) =>
+  new Promise((resolve) => setTimeout(resolve, delayMs));
+
+const findDriveFilesByName = async ({ drive, folderId, fileName }) => {
+  if (!drive || !folderId || !fileName) return null;
+
+  const query = [
+    `name = '${escapeDriveQueryValue(fileName)}'`,
+    `'${folderId}' in parents`,
+    "trashed = false",
+  ].join(" and ");
+
+  const response = await drive.files.list({
+    q: query,
+    fields: "files(id,name,webViewLink,webContentLink)",
+    pageSize: 10,
+    includeItemsFromAllDrives: true,
+    supportsAllDrives: true,
+  });
+
+  const matches = Array.isArray(response.data.files) ? response.data.files : [];
+  if (matches.length > 1) {
+    console.warn(
+      `[GOOGLE-DRIVE] Found ${matches.length} existing files named "${fileName}" in folder ${folderId}. Reusing the first match.`,
+    );
+  }
+
+  return matches;
+};
+
+const cleanupDuplicateDriveFiles = async ({
+  drive,
+  folderId,
+  fileName,
+  keepFileId,
+}) => {
+  const matches = await findDriveFilesByName({
+    drive,
+    folderId,
+    fileName,
+  });
+  const normalizedMatches = Array.isArray(matches) ? matches : [];
+  const duplicates = normalizedMatches.filter(
+    (item) => item?.id && item.id !== keepFileId,
+  );
+
+  for (const duplicate of duplicates) {
+    try {
+      await drive.files.delete({
+        fileId: duplicate.id,
+        supportsAllDrives: true,
+      });
+      console.log(
+        `[GOOGLE-DRIVE] Removed duplicate file "${fileName}" (${duplicate.id}) from folder ${folderId}`,
+      );
+    } catch (error) {
+      if (error?.code === 404) {
+        continue;
+      }
+      console.warn(
+        `[GOOGLE-DRIVE] Failed to remove duplicate file "${fileName}" (${duplicate.id}): ${error.message}`,
+      );
+    }
+  }
+
+  if (duplicates.length) {
+    clearDriveCaches();
+  }
+
+  return {
+    matches: normalizedMatches,
+    removedFileIds: duplicates.map((item) => item.id),
+  };
+};
+
+const cleanupDuplicateDriveFilesByName = async ({
+  folderId,
+  fileName,
+  keepFileId,
+}) => {
+  const drive = await getDriveClient();
+  return cleanupDuplicateDriveFiles({
+    drive,
+    folderId,
+    fileName,
+    keepFileId,
+  });
+};
+
+const isRetryableDriveError = (error) => {
+  const statusCode =
+    error?.code || error?.statusCode || error?.response?.status || null;
+  if ([408, 409, 429, 500, 502, 503, 504].includes(Number(statusCode))) {
+    return true;
+  }
+
+  const normalizedMessage = String(error?.message || "").toLowerCase();
+  return [
+    "timeout",
+    "temporarily unavailable",
+    "socket hang up",
+    "econnreset",
+    "rate limit",
+    "quota exceeded",
+    "backend error",
+  ].some((token) => normalizedMessage.includes(token));
+};
+
 const uploadToDrive = async ({
   fileBuffer,
   mimeType,
@@ -334,43 +798,57 @@ const uploadToDrive = async ({
   const folderMetadata = await getFolderMetadata(drive, folderId);
   const isSharedDriveFolder = Boolean(folderMetadata?.driveId);
 
-  if (
-    authContext.authMode === "service_account" &&
-    !isSharedDriveFolder &&
-    !impersonatedUserEmail
-  ) {
-    throw new Error(
-      buildDriveQuotaErrorMessage({
-        folderId,
-        folderName: folderMetadata?.name,
-        isSharedDriveFolder,
-        serviceAccountEmail: credentials.client_email,
-        impersonatedUserEmail,
-        authMode: authContext.authMode,
-      }),
-    );
-  }
-
   const driveFileName = buildDriveFileName({
     fileName,
     originalName,
     mimeType,
   });
 
-  let createResponse;
+  console.log(
+    `[GOOGLE-DRIVE] Uploading "${driveFileName}" to folder ${folderId} (${folderMetadata?.name || "unknown"}) using ${authContext.authMode}${isSharedDriveFolder ? " [shared-drive]" : " [my-drive]"}`,
+  );
+
+  let fileResponse;
   try {
-    createResponse = await drive.files.create({
-      requestBody: {
-        name: driveFileName,
-        parents: [folderId],
-      },
-      media: {
-        mimeType,
-        body: Readable.from(fileBuffer),
-      },
-      fields: "id,name,webViewLink,webContentLink",
-      supportsAllDrives: true,
+    const existingMatches = await findDriveFilesByName({
+      drive,
+      folderId,
+      fileName: driveFileName,
     });
+    const existingFile = Array.isArray(existingMatches)
+      ? existingMatches[0] || null
+      : null;
+
+    if (existingFile?.id) {
+      console.log(
+        `[GOOGLE-DRIVE] Replacing existing file "${driveFileName}" (${existingFile.id}) in folder ${folderId}`,
+      );
+      fileResponse = await drive.files.update({
+        fileId: existingFile.id,
+        requestBody: {
+          name: driveFileName,
+        },
+        media: {
+          mimeType,
+          body: Readable.from(fileBuffer),
+        },
+        fields: "id,name,webViewLink,webContentLink",
+        supportsAllDrives: true,
+      });
+    } else {
+      fileResponse = await drive.files.create({
+        requestBody: {
+          name: driveFileName,
+          parents: [folderId],
+        },
+        media: {
+          mimeType,
+          body: Readable.from(fileBuffer),
+        },
+        fields: "id,name,webViewLink,webContentLink",
+        supportsAllDrives: true,
+      });
+    }
   } catch (error) {
     if (isStorageQuotaExceededError(error)) {
       throw new Error(
@@ -388,16 +866,40 @@ const uploadToDrive = async ({
     throw error;
   }
 
-  const fileId = createResponse.data.id;
+  const fileId = fileResponse.data.id;
 
-  await drive.permissions.create({
-    fileId,
-    requestBody: {
-      role: "reader",
-      type: "anyone",
-    },
-    supportsAllDrives: true,
-  });
+  console.log(
+    `[GOOGLE-DRIVE] Uploaded "${driveFileName}" as file ${fileId} into folder ${folderId}`,
+  );
+
+  if (fileName) {
+    await cleanupDuplicateDriveFiles({
+      drive,
+      folderId,
+      fileName: driveFileName,
+      keepFileId: fileId,
+    });
+  }
+
+  try {
+    await drive.permissions.create({
+      fileId,
+      requestBody: {
+        role: "reader",
+        type: "anyone",
+      },
+      supportsAllDrives: true,
+    });
+  } catch (permissionError) {
+    const statusCode =
+      permissionError?.code ||
+      permissionError?.statusCode ||
+      permissionError?.response?.status ||
+      null;
+    if (Number(statusCode) !== 409) {
+      throw permissionError;
+    }
+  }
 
   const metadataResponse = await drive.files.get({
     fileId,
@@ -418,6 +920,56 @@ const uploadToDrive = async ({
   };
 };
 
+const uploadFile = async (filePath, fileName, folderId, mimeType = null) => {
+  if (!filePath) {
+    throw new Error("filePath is required for uploadFile");
+  }
+
+  const fileBuffer = await fs.promises.readFile(filePath);
+  const detectedMimeType =
+    mimeType ||
+    EXTENSION_MIME_MAP[
+      String(path.extname(fileName || filePath || "")).toLowerCase()
+    ] ||
+    "application/octet-stream";
+
+  return uploadToDriveWithRetry({
+    fileBuffer,
+    mimeType: detectedMimeType,
+    originalName: path.basename(fileName || filePath),
+    folderId,
+    fileName: fileName || path.basename(filePath),
+  });
+};
+
+const uploadToDriveWithRetry = async (
+  uploadPayload,
+  {
+    attempts = 3,
+    initialDelayMs = 400,
+    backoffMultiplier = 2,
+  } = {},
+) => {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await uploadToDrive(uploadPayload);
+    } catch (error) {
+      lastError = error;
+      const retryable = attempt < attempts && isRetryableDriveError(error);
+      console.error(
+        `[GOOGLE-DRIVE] Upload attempt ${attempt}/${attempts} failed: ${error.message}`,
+      );
+      if (!retryable) break;
+      const nextDelay = initialDelayMs * backoffMultiplier ** (attempt - 1);
+      await waitForRetry(nextDelay);
+    }
+  }
+
+  throw lastError;
+};
+
 const deleteFromDrive = async (fileId) => {
   if (!fileId) return;
 
@@ -428,6 +980,7 @@ const deleteFromDrive = async (fileId) => {
       fileId,
       supportsAllDrives: true,
     });
+    clearDriveCaches();
   } catch (error) {
     if (error?.code === 404) {
       return;
@@ -439,7 +992,21 @@ const deleteFromDrive = async (fileId) => {
 
 module.exports = {
   DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID,
+  getFolderLink,
+  createFolder,
   ensureDriveFolder,
+  listDriveFoldersByName,
+  findDriveFolder,
+  listDriveFolderChildren,
+  mergeDuplicateDriveFolders,
+  cleanupDuplicateDriveFoldersByName,
+  moveDriveItemToParent,
+  syncDriveFolder,
+  findDriveFilesByName,
+  cleanupDuplicateDriveFiles,
+  cleanupDuplicateDriveFilesByName,
+  uploadFile,
   uploadToDrive,
+  uploadToDriveWithRetry,
   deleteFromDrive,
 };
