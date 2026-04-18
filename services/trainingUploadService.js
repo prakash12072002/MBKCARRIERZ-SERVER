@@ -9,7 +9,7 @@ const {
 } = require("../models");
 const {
   uploadToDriveWithRetry,
-} = require("./googleDriveService");
+} = require("../modules/drive/driveGateway");
 const {
   buildDriveFolderLink,
   ensureScheduleFolderState,
@@ -308,6 +308,12 @@ const assertUploadAccess = ({ userRole, requesterTrainer, schedule }) => {
     }
 
     if (toIdString(schedule.trainerId) !== toIdString(requesterTrainer._id)) {
+      console.warn(`[DIAGNOSTIC] BRANCH=trainingUploadService_assertUploadAccess;` +
+                   `providedTrainer=${toIdString(requesterTrainer._id)};type=${typeof requesterTrainer._id};` +
+                   `expectedTrainer=${toIdString(schedule.trainerId)};type=${typeof schedule.trainerId};` +
+                   `scheduleId=${toIdString(schedule._id)};` +
+                   `rejectionEnum=TRAINER_MISMATCH`);
+                   
       throw new Error("Trainer can only upload for the assigned day and batch");
     }
 

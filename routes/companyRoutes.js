@@ -5,12 +5,37 @@ const { authenticate } = require('../middleware/auth');
 const { upload } = require('../config/cloudinary');
 const crypto = require('crypto');
 const { sendMail, sendCompanyAdminWelcomeEmail } = require('../utils/emailService');
+const { uploadCompanyLogoToDrive } = require('../utils/companyLogoUpload');
 const { cascadeDeleteCompanyHierarchy } = require('../services/hierarchyDeleteService');
 const {
     ensureCompanyHierarchy,
     isTrainingDriveEnabled,
-} = require('../services/googleDriveTrainingHierarchyService');
+} = require('../modules/drive/driveGateway');
 const isCompanyAdminRole = (role) => ['CompanyAdmin', 'companyadmin'].includes(String(role || ''));
+
+const getStoredLogoPath = (file) => {
+    if (!file) return null;
+
+    const directUrl = file.path || file.secure_url || file.url;
+    if (typeof directUrl === 'string' && /^https?:\/\//i.test(directUrl)) {
+        return directUrl;
+    }
+
+    if (file.filename) {
+        return `/uploads/trainer-documents/${file.filename}`;
+    }
+
+    if (typeof directUrl === 'string') {
+        const normalized = directUrl.replace(/\\/g, '/');
+        const marker = '/uploads/';
+        const markerIndex = normalized.toLowerCase().lastIndexOf(marker);
+        if (markerIndex >= 0) {
+            return normalized.slice(markerIndex);
+        }
+    }
+
+    return null;
+};
 
 // @route   POST /api/companies/send-otp
 // @desc    Generate OTP and send to Company Admin Email
@@ -84,6 +109,7 @@ router.get('/:id', authenticate, async (req, res) => {
 router.post('/', authenticate, upload.single('logo'), async (req, res) => {
     try {
         const { adminName, adminEmail: email } = req.body;
+        const storedLogoPath = getStoredLogoPath(req.file);
 
         console.log('Creating company invite for:', { adminName, email });
 
@@ -152,7 +178,7 @@ router.post('/', authenticate, upload.single('logo'), async (req, res) => {
                 adminName: inferredName,
                 phone: 'To be provided during onboarding',
                 address: 'To be provided during onboarding',
-                logoUrl: null,
+                logoUrl: storedLogoPath,
                 verificationLink
             });
         } catch (emailError) {
@@ -236,8 +262,9 @@ router.put('/:code', authenticate, upload.single('logo'), async (req, res) => {
         Object.assign(company, updateData);
         
         // Update logo if a new file is uploaded
-        if (req.file) {
-            company.logo = req.file.path; // Cloudinary URL
+        const storedLogoPath = getStoredLogoPath(req.file);
+        if (storedLogoPath) {
+            company.logo = storedLogoPath;
         } else if (req.body.logo) {
             // Preserve existing logo URL if passed in body and no new file uploaded
             company.logo = req.body.logo;
@@ -245,17 +272,34 @@ router.put('/:code', authenticate, upload.single('logo'), async (req, res) => {
         
         await company.save();
 
+        let companyHierarchy = null;
         if (isTrainingDriveEnabled()) {
             try {
-                const hierarchy = await ensureCompanyHierarchy({ company });
-                if (hierarchy?.companyFolder?.id) {
-                    company.driveFolderId = hierarchy.companyFolder.id;
-                    company.driveFolderName = hierarchy.companyFolder.name;
-                    company.driveFolderLink = hierarchy.companyFolder.link;
+                companyHierarchy = await ensureCompanyHierarchy({ company });
+                if (companyHierarchy?.companyFolder?.id) {
+                    company.driveFolderId = companyHierarchy.companyFolder.id;
+                    company.driveFolderName = companyHierarchy.companyFolder.name;
+                    company.driveFolderLink = companyHierarchy.companyFolder.link;
                     await company.save();
                 }
             } catch (driveError) {
                 console.error('[GOOGLE-DRIVE] Failed to sync company hierarchy:', driveError.message);
+            }
+        }
+
+        if (req.file && isTrainingDriveEnabled()) {
+            try {
+                const logoDriveUpload = await uploadCompanyLogoToDrive({
+                    file: req.file,
+                    company,
+                    hierarchy: companyHierarchy,
+                });
+                if (logoDriveUpload?.logoUrl) {
+                    company.logo = logoDriveUpload.logoUrl;
+                    await company.save();
+                }
+            } catch (driveLogoError) {
+                console.error('[GOOGLE-DRIVE] Failed to upload company logo:', driveLogoError.message);
             }
         }
 

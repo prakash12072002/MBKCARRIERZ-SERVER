@@ -96,7 +96,12 @@ const userSchema = new mongoose.Schema({
     },
     firebaseUid: {
         type: String,
-        default: null,
+        default: undefined,
+        set: (value) => {
+            if (value === null || value === undefined) return undefined;
+            const normalized = String(value).trim();
+            return normalized ? normalized : undefined;
+        },
     },
     profilePicture: {
         type: String,
@@ -108,6 +113,9 @@ const userSchema = new mongoose.Schema({
 }, {
     timestamps: true,
 });
+
+// Firebase users should be unique, but non-firebase users may omit this field.
+userSchema.index({ firebaseUid: 1 }, { unique: true, sparse: true });
 
 // Hash password before saving
 userSchema.pre('save', async function(next) {

@@ -39,7 +39,7 @@ const attendanceSchema = new mongoose.Schema({
     },
     status: {
         type: String,
-        enum: ['Present', 'Absent', 'Leave', 'Late', 'Pending'],
+        enum: ['Present', 'Absent', 'Leave', 'Late', 'Pending', 'cancelled'],
         default: 'Absent', // Legacy Support
     },
     syllabus: {
@@ -67,6 +67,50 @@ const attendanceSchema = new mongoose.Schema({
         type: String,
         enum: ['pending', 'approved', 'rejected'],
         default: 'pending',
+    },
+    checkOutCapturedAt: {
+        type: Date,
+        default: null,
+    },
+    checkOutLatitude: {
+        type: Number,
+        default: null,
+    },
+    checkOutLongitude: {
+        type: Number,
+        default: null,
+    },
+    checkOutGeoDistanceMeters: {
+        type: Number,
+        default: null,
+    },
+    checkOutVerificationStatus: {
+        type: String,
+        enum: ['PENDING_CHECKOUT', 'AUTO_VERIFIED', 'VERIFIED', 'MANUAL_REVIEW_REQUIRED', 'REJECTED'],
+        default: 'PENDING_CHECKOUT',
+    },
+    checkOutVerificationMode: {
+        type: String,
+        enum: ['AUTO', 'MANUAL'],
+        default: 'AUTO',
+    },
+    checkOutVerificationReason: {
+        type: String,
+        default: null,
+    },
+    checkOutVerifiedAt: {
+        type: Date,
+        default: null,
+    },
+    checkOutVerifiedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        default: null,
+    },
+    driveSyncStatus: {
+        type: String,
+        enum: ['PENDING', 'QUEUED', 'SYNCED', 'FAILED'],
+        default: 'PENDING',
     },
     verifiedBy: {
         type: mongoose.Schema.Types.ObjectId,
@@ -176,6 +220,8 @@ const attendanceSchema = new mongoose.Schema({
             longitude: { type: Number, default: null },
             capturedAt: { type: Date, default: null },
             distanceKm: { type: Number, default: null },
+            validationSource: { type: String, default: null },
+            verificationReport: { type: mongoose.Schema.Types.Mixed, default: null },
         }]
     },
     images: [{
@@ -268,8 +314,18 @@ const attendanceSchema = new mongoose.Schema({
 });
 
 attendanceSchema.index({ scheduleId: 1 });
+attendanceSchema.index({ scheduleId: 1, createdAt: -1 });
+attendanceSchema.index({ trainerId: 1 });
 attendanceSchema.index({ trainerId: 1, date: -1 });
+attendanceSchema.index({ date: -1 });
+attendanceSchema.index({ status: 1 });
+attendanceSchema.index({ trainerId: 1, verificationStatus: 1, date: -1 });
 attendanceSchema.index({ collegeId: 1, dayNumber: 1 });
+attendanceSchema.index({ collegeId: 1, verificationStatus: 1, date: -1 });
+attendanceSchema.index({ verificationStatus: 1, date: -1, createdAt: -1 });
+attendanceSchema.index({ geoVerificationStatus: 1, checkOutTime: 1, date: -1 });
+attendanceSchema.index({ checkOutVerificationStatus: 1, date: -1 });
+attendanceSchema.index({ driveSyncStatus: 1, updatedAt: -1 });
 attendanceSchema.index({ driveFolderId: 1 }, { sparse: true });
 
 const Attendance = mongoose.model('Attendance', attendanceSchema);

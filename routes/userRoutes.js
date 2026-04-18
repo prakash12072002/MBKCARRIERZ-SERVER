@@ -11,7 +11,10 @@ const {
 // const admin = require('../config/firebaseAdmin'); // Removed Firebase
 const { authenticate } = require('../middleware/auth');
 const { REQUIRED_TRAINER_DOCUMENTS } = require('../utils/trainerDocumentWorkflow');
-const { autoCreateTrainerAdminChannels } = require('../services/streamChatService');
+const {
+    autoCreateTrainerAdminChannels,
+    cleanupDeletedUserChatArtifacts,
+} = require('../services/streamChatService');
 
 // Verify Password (for sensitive actions like delete)
 router.post('/verify-password', authenticate, async (req, res) => {
@@ -112,44 +115,6 @@ router.get('/rejected', authenticate, async (req, res) => {
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
-
-// REMOVED: Duplicate /approve endpoint - proper one with SuperAdmin check exists at line 277
-// router.put('/:id/approve', authenticate, async (req, res) => {
-//     try {
-//         const user = await User.findById(req.params.id);
-//         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-//
-//         user.accountStatus = 'active';
-//         user.isActive = true;
-//
-//         // Ensure role is correct if needed, but usually it's set on signup
-//         await user.save();
-//
-//         // Optional: Send email notification
-//
-//         res.json({ success: true, message: 'User approved' });
-//     } catch (error) {
-//         console.error('Error approving user:', error);
-//         res.status(500).json({ success: false, message: 'Server error' });
-//     }
-// });
-
-// REMOVED: Duplicate /reject endpoint - proper one with SuperAdmin check exists at line 316
-// router.put('/:id/reject', authenticate, async (req, res) => {
-//     try {
-//         const user = await User.findById(req.params.id);
-//         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-//
-//         user.accountStatus = 'rejected';
-//         user.isActive = false;
-//         await user.save();
-//
-//         res.json({ success: true, message: 'User rejected' });
-//     } catch (error) {
-//         console.error('Error rejecting user:', error);
-//         res.status(500).json({ success: false, message: 'Server error' });
-//     }
-// });
 
 // Bulk Approve All Pending
 router.put('/approve-all', authenticate, async (req, res) => {
@@ -346,7 +311,7 @@ router.put('/:id/approve', authenticate, async (req, res) => {
         try {
             if (user.role === 'Trainer') {
                 const { sendTrainerApprovalEmail } = require('../utils/emailService');
-                const loginUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/login/trainer`;
+                const loginUrl = `${(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '')}/login`;
                 await sendTrainerApprovalEmail(user.email, user.name, loginUrl);
             }
         } catch (notifyError) {
@@ -556,6 +521,12 @@ router.delete('/:id', authenticate, async (req, res) => {
                 success: false,
                 message: 'User not found'
             });
+        }
+
+        try {
+            await cleanupDeletedUserChatArtifacts(user);
+        } catch (chatCleanupError) {
+            console.warn('User chat cleanup failed during delete:', chatCleanupError.message);
         }
 
         // Cascading deletion

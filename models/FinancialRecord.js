@@ -32,6 +32,10 @@ const financialRecordSchema = new mongoose.Schema({
     timestamps: true,
 });
 
+financialRecordSchema.index({ trainerId: 1, date: -1 });
+financialRecordSchema.index({ status: 1, date: -1 });
+financialRecordSchema.index({ type: 1, date: -1 });
+
 const FinancialRecord = mongoose.model('FinancialRecord', financialRecordSchema);
 
 module.exports = FinancialRecord;

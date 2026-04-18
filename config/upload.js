@@ -30,6 +30,22 @@ const EXCEL_MIME_TYPES = new Set([
 const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png']);
 const VIDEO_MIME_TYPES = new Set(['video/mp4']);
 
+const parseEnvPositiveInt = (value, fallback) => {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const MANUAL_IMAGE_MAX_SIZE_MB = parseEnvPositiveInt(
+    process.env.ATTENDANCE_MANUAL_IMAGE_MAX_SIZE_MB,
+    5
+);
+const GEO_IMAGE_MAX_SIZE_MB = parseEnvPositiveInt(
+    process.env.ATTENDANCE_GEO_IMAGE_MAX_SIZE_MB,
+    15
+);
+
+const toBytesFromMb = (sizeMb) => sizeMb * 1024 * 1024;
+
 // Ensure upload directories exist
 const uploadDir = './uploads/attendance';
 const imageDir = path.join(uploadDir, 'images');
@@ -179,11 +195,22 @@ const uploadManual = multer({
     storage: imageStorage,
     fileFilter: fileFilter,
     limits: {
-        fileSize: 5 * 1024 * 1024
+        fileSize: toBytesFromMb(MANUAL_IMAGE_MAX_SIZE_MB)
+    }
+}).single('image');
+
+// Upload middleware for trainer geo checkout image slot upload
+const uploadGeoImage = multer({
+    storage: imageStorage,
+    fileFilter: fileFilter,
+    limits: {
+        fileSize: toBytesFromMb(GEO_IMAGE_MAX_SIZE_MB)
     }
 }).single('image');
 
 module.exports = {
     uploadAttendance,
-    uploadManual
+    uploadManual,
+    uploadGeoImage,
+    GEO_IMAGE_MAX_SIZE_MB,
 };

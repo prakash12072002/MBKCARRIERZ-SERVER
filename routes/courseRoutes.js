@@ -7,7 +7,7 @@ const { cascadeDeleteCoursesByIds } = require('../services/hierarchyDeleteServic
 const {
     ensureCourseHierarchy,
     isTrainingDriveEnabled,
-} = require('../services/googleDriveTrainingHierarchyService');
+} = require('../modules/drive/driveGateway');
 
 // @route   GET /api/courses
 // @desc    Get all courses (optionally filtered by companyId)

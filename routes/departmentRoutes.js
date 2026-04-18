@@ -8,7 +8,7 @@ const {
     ensureDepartmentHierarchy,
     isTrainingDriveEnabled,
     toDepartmentDayFolders,
-} = require('../services/googleDriveTrainingHierarchyService');
+} = require('../modules/drive/driveGateway');
 const {
     normalizeRole,
     parseDepartments,
@@ -52,12 +52,38 @@ const hasGeoTagDocs = (attendance) =>
         || (Array.isArray(attendance?.activityVideos) && attendance.activityVideos.length)
     );
 
+const normalizeGeoVerificationToken = (value) =>
+    String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+
+const isGeoVerificationApproved = (attendance) => {
+    const legacyGeoVerification = normalizeGeoVerificationToken(attendance?.geoVerificationStatus);
+    if (legacyGeoVerification === 'approved') {
+        return true;
+    }
+
+    const checkOutVerification = normalizeGeoVerificationToken(attendance?.checkOutVerificationStatus);
+    return checkOutVerification === 'auto_verified'
+        || checkOutVerification === 'approved'
+        || checkOutVerification === 'verified'
+        || checkOutVerification === 'completed';
+};
+
+const isGeoVerificationRejected = (attendance) => {
+    const legacyGeoVerification = normalizeGeoVerificationToken(attendance?.geoVerificationStatus);
+    const checkOutVerification = normalizeGeoVerificationToken(attendance?.checkOutVerificationStatus);
+
+    return legacyGeoVerification === 'rejected' || checkOutVerification === 'rejected';
+};
+
 const buildDocsStatusLabel = (attendance) => hasAttendanceDocs(attendance) ? 'Docs Uploaded' : 'Pending';
 
 const buildGeoStatusLabel = (attendance) => {
-    const normalized = String(attendance?.geoVerificationStatus || '').trim().toLowerCase();
-    if (normalized === 'approved') return 'Completed';
-    return 'Pending';
+    if (isGeoVerificationApproved(attendance)) return 'Geo Verified';
+    if (isGeoVerificationRejected(attendance)) return 'Geo Rejected';
+
+    const checkOutVerification = normalizeGeoVerificationToken(attendance?.checkOutVerificationStatus);
+    if (checkOutVerification === 'manual_review_required') return 'Geo Manual Review';
+    return 'Geo Pending';
 };
 
 const normalizeDayStatus = (value) => {
@@ -76,22 +102,12 @@ const buildDayUploadStatus = (schedule, attendance) => {
         ? schedule.geoTagUploaded
         : hasGeoTagDocs(attendance);
     const persistedDayStatus = normalizeDayStatus(schedule?.dayStatus);
-    if (persistedDayStatus) {
-        return {
-            attendanceUploaded,
-            geoTagUploaded,
-            statusCode: persistedDayStatus,
-            statusLabel: persistedDayStatus === 'completed'
-                ? 'Completed'
-                : persistedDayStatus === 'pending'
-                    ? 'Pending'
-                    : 'Not Assigned',
-        };
-    }
     const normalizedScheduleStatus = String(schedule?.status || '').trim().toLowerCase();
     const hasTrainerAssigned = Boolean(schedule?.trainerId);
-    const attendanceVerified = String(attendance?.verificationStatus || '').trim().toLowerCase() === 'approved';
-    const geoVerified = String(attendance?.geoVerificationStatus || '').trim().toLowerCase() === 'approved';
+    const attendanceVerified = normalizeGeoVerificationToken(attendance?.verificationStatus) === 'approved';
+    const geoVerified = isGeoVerificationApproved(attendance);
+    const docsRejected = normalizeGeoVerificationToken(attendance?.verificationStatus) === 'rejected'
+        || isGeoVerificationRejected(attendance);
 
     if (!hasTrainerAssigned || normalizedScheduleStatus === 'cancelled') {
         return {
@@ -102,12 +118,31 @@ const buildDayUploadStatus = (schedule, attendance) => {
         };
     }
 
-    if (attendanceUploaded && geoTagUploaded && attendanceVerified && geoVerified) {
+    if (attendanceUploaded && geoTagUploaded && attendanceVerified && geoVerified && !docsRejected) {
         return {
             attendanceUploaded,
             geoTagUploaded,
             statusCode: 'completed',
             statusLabel: 'Completed',
+        };
+    }
+
+    // Backward compatibility: keep persisted completion if docs remain uploaded and not rejected.
+    if (persistedDayStatus === 'completed' && attendanceUploaded && geoTagUploaded && !docsRejected) {
+        return {
+            attendanceUploaded,
+            geoTagUploaded,
+            statusCode: 'completed',
+            statusLabel: 'Completed',
+        };
+    }
+
+    if (persistedDayStatus === 'pending' || persistedDayStatus === 'not_assigned') {
+        return {
+            attendanceUploaded,
+            geoTagUploaded,
+            statusCode: persistedDayStatus,
+            statusLabel: persistedDayStatus === 'pending' ? 'Pending' : 'Not Assigned',
         };
     }
 

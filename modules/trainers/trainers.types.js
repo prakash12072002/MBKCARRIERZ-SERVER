@@ -1,0 +1,25 @@
+const TRAINER_DIRECTORY_ALLOWED_ROLES = Object.freeze([
+  "superadmin",
+  "spocadmin",
+  "accountant",
+  "accoundant",
+]);
+
+const TRAINER_DIRECTORY_SORT = Object.freeze({
+  NEWEST: "newest",
+  OLDEST: "oldest",
+  NAME_ASC: "name_asc",
+  NAME_DESC: "name_desc",
+});
+
+const DEFAULT_TRAINER_DIRECTORY_PAGE = 1;
+const DEFAULT_TRAINER_DIRECTORY_LIMIT = 50;
+const MAX_TRAINER_DIRECTORY_LIMIT = 100;
+
+module.exports = {
+  TRAINER_DIRECTORY_ALLOWED_ROLES,
+  TRAINER_DIRECTORY_SORT,
+  DEFAULT_TRAINER_DIRECTORY_PAGE,
+  DEFAULT_TRAINER_DIRECTORY_LIMIT,
+  MAX_TRAINER_DIRECTORY_LIMIT,
+};

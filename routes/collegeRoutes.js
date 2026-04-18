@@ -8,7 +8,7 @@ const {
     ensureDepartmentHierarchy,
     isTrainingDriveEnabled,
     toDepartmentDayFolders,
-} = require('../services/googleDriveTrainingHierarchyService');
+} = require('../modules/drive/driveGateway');
 const {
     normalizeRole,
     canAccessCollegeByCompany,
@@ -16,6 +16,12 @@ const {
     getUserCompanyIds,
     getUserCollegeIds,
 } = require('../utils/departmentAccess');
+const {
+    normalizeCollegeLocation,
+    hasValidCollegeCoordinates,
+    mergeCollegeLocations,
+    collegeLocationsEqual,
+} = require('../utils/collegeLocation');
 
 // Middleware to check if user is SPOCAdmin or SuperAdmin
 const isSPOCAdmin = (req, res, next) => {
@@ -79,6 +85,34 @@ const hasViewPermission = (permissions = []) => {
     return normalized.includes('view') || normalized.includes('*') || normalized.includes('all');
 };
 
+const syncCollegeLocationToSchedules = async (collegeId, collegeLike) => {
+    const normalizedCollegeLocation = normalizeCollegeLocation(collegeLike);
+    if (!collegeId || !hasValidCollegeCoordinates(normalizedCollegeLocation)) return;
+
+    const { Schedule } = require('../models');
+    const schedules = await Schedule.find({ collegeId }).select('_id collegeLocation');
+    if (!schedules.length) return;
+
+    const updates = schedules.reduce((result, schedule) => {
+        const mergedLocation = mergeCollegeLocations(normalizedCollegeLocation, schedule.collegeLocation);
+        if (!mergedLocation || collegeLocationsEqual(schedule.collegeLocation, mergedLocation)) {
+            return result;
+        }
+
+        result.push({
+            updateOne: {
+                filter: { _id: schedule._id },
+                update: { $set: { collegeLocation: mergedLocation } }
+            }
+        });
+        return result;
+    }, []);
+
+    if (updates.length) {
+        await Schedule.bulkWrite(updates, { ordered: false });
+    }
+};
+
 const hasAttendanceDocs = (attendance) =>
     Boolean(attendance?.attendancePdfUrl || attendance?.attendanceExcelUrl);
 
@@ -92,12 +126,71 @@ const hasGeoTagDocs = (attendance) =>
         || (Array.isArray(attendance?.activityVideos) && attendance.activityVideos.length)
     );
 
+const normalizeGeoVerificationToken = (value) =>
+    String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+
+const deriveCheckoutGeoState = (attendance) => {
+    const checkOutVerification = normalizeGeoVerificationToken(attendance?.checkOutVerificationStatus);
+    if (checkOutVerification) {
+        if (
+            checkOutVerification === 'auto_verified'
+            || checkOutVerification === 'approved'
+            || checkOutVerification === 'verified'
+            || checkOutVerification === 'completed'
+        ) {
+            return 'approved';
+        }
+
+        if (checkOutVerification === 'rejected' || checkOutVerification === 'manually_rejected') {
+            return 'rejected';
+        }
+
+        if (
+            checkOutVerification === 'manual_review_required'
+            || checkOutVerification === 'manual_review'
+            || checkOutVerification === 'review_required'
+        ) {
+            return 'manual_review_required';
+        }
+
+        if (checkOutVerification === 'pending_checkout' || checkOutVerification === 'pending') {
+            return 'pending';
+        }
+    }
+
+    const legacyGeoVerification = normalizeGeoVerificationToken(attendance?.geoVerificationStatus);
+    if (legacyGeoVerification === 'approved') return 'approved';
+    if (legacyGeoVerification === 'rejected') return 'rejected';
+    return 'pending';
+};
+
+const isGeoVerificationApproved = (attendance) => {
+    return deriveCheckoutGeoState(attendance) === 'approved';
+};
+
+const isGeoVerificationRejected = (attendance) => {
+    return deriveCheckoutGeoState(attendance) === 'rejected';
+};
+
+const isAttendanceVerificationApproved = (attendance) => {
+    const token = normalizeGeoVerificationToken(attendance?.verificationStatus);
+    return (
+        token === 'approved'
+        || token === 'verified'
+        || token === 'completed'
+        || token === 'auto_verified'
+        || token === 'manually_verified'
+    );
+};
+
 const buildDocsStatusLabel = (attendance) => hasAttendanceDocs(attendance) ? 'Docs Uploaded' : 'Pending';
 
 const buildGeoStatusLabel = (attendance) => {
-    const normalized = String(attendance?.geoVerificationStatus || '').trim().toLowerCase();
-    if (normalized === 'approved') return 'Completed';
-    return 'Pending';
+    const geoState = deriveCheckoutGeoState(attendance);
+    if (geoState === 'approved') return 'Geo Verified';
+    if (geoState === 'rejected') return 'Geo Rejected';
+    if (geoState === 'manual_review_required') return 'Geo Manual Review';
+    return 'Geo Pending';
 };
 
 const normalizeDayStatus = (value) => {
@@ -109,29 +202,22 @@ const normalizeDayStatus = (value) => {
 };
 
 const buildDayUploadStatus = (schedule, attendance) => {
-    const attendanceUploaded = typeof schedule?.attendanceUploaded === 'boolean'
-        ? schedule.attendanceUploaded
-        : hasAttendanceDocs(attendance);
-    const geoTagUploaded = typeof schedule?.geoTagUploaded === 'boolean'
-        ? schedule.geoTagUploaded
-        : hasGeoTagDocs(attendance);
+    const attendanceUploaded = Boolean(
+        hasAttendanceDocs(attendance)
+        || schedule?.attendanceUploaded === true
+    );
+    const geoTagUploaded = Boolean(
+        hasGeoTagDocs(attendance)
+        || schedule?.geoTagUploaded === true
+    );
     const persistedDayStatus = normalizeDayStatus(schedule?.dayStatus);
-    if (persistedDayStatus) {
-        return {
-            attendanceUploaded,
-            geoTagUploaded,
-            statusCode: persistedDayStatus,
-            statusLabel: persistedDayStatus === 'completed'
-                ? 'Completed'
-                : persistedDayStatus === 'pending'
-                    ? 'Pending'
-                    : 'Not Assigned',
-        };
-    }
     const normalizedScheduleStatus = String(schedule?.status || '').trim().toLowerCase();
     const hasTrainerAssigned = Boolean(schedule?.trainerId);
-    const attendanceVerified = String(attendance?.verificationStatus || '').trim().toLowerCase() === 'approved';
-    const geoVerified = String(attendance?.geoVerificationStatus || '').trim().toLowerCase() === 'approved';
+    const attendanceVerified = isAttendanceVerificationApproved(attendance);
+    const geoVerified = isGeoVerificationApproved(attendance);
+    const docsRejected = normalizeGeoVerificationToken(attendance?.verificationStatus) === 'rejected'
+        || isGeoVerificationRejected(attendance);
+    const checkoutGeoState = deriveCheckoutGeoState(attendance);
 
     if (!hasTrainerAssigned || normalizedScheduleStatus === 'cancelled') {
         return {
@@ -142,12 +228,38 @@ const buildDayUploadStatus = (schedule, attendance) => {
         };
     }
 
-    if (attendanceUploaded && geoTagUploaded && attendanceVerified && geoVerified) {
+    if (attendanceUploaded && geoTagUploaded && attendanceVerified && geoVerified && !docsRejected) {
         return {
             attendanceUploaded,
             geoTagUploaded,
             statusCode: 'completed',
             statusLabel: 'Completed',
+        };
+    }
+
+    // Backward compatibility: keep persisted completion if docs remain uploaded and not rejected.
+    if (
+        persistedDayStatus === 'completed'
+        && attendanceUploaded
+        && geoTagUploaded
+        && !docsRejected
+        && checkoutGeoState !== 'manual_review_required'
+        && checkoutGeoState !== 'pending'
+    ) {
+        return {
+            attendanceUploaded,
+            geoTagUploaded,
+            statusCode: 'completed',
+            statusLabel: 'Completed',
+        };
+    }
+
+    if (persistedDayStatus === 'pending' || persistedDayStatus === 'not_assigned') {
+        return {
+            attendanceUploaded,
+            geoTagUploaded,
+            statusCode: persistedDayStatus,
+            statusLabel: persistedDayStatus === 'pending' ? 'Pending' : 'Not Assigned',
         };
     }
 
@@ -157,6 +269,65 @@ const buildDayUploadStatus = (schedule, attendance) => {
         statusCode: 'pending',
         statusLabel: 'Pending',
     };
+};
+
+const toAttendanceEventTime = (attendance) => {
+    const candidates = [
+        attendance?.updatedAt,
+        attendance?.createdAt,
+        attendance?.checkOutVerifiedAt,
+        attendance?.approvedAt,
+        attendance?.checkOutCapturedAt,
+    ];
+
+    for (const candidate of candidates) {
+        const parsed = new Date(candidate);
+        if (!Number.isNaN(parsed.getTime())) {
+            return parsed.getTime();
+        }
+    }
+
+    return 0;
+};
+
+const computeAttendanceSelectionScore = (attendance) => {
+    const docsApproved = normalizeGeoVerificationToken(attendance?.verificationStatus) === 'approved';
+    const docsRejected = normalizeGeoVerificationToken(attendance?.verificationStatus) === 'rejected';
+    const geoState = deriveCheckoutGeoState(attendance);
+    const geoApproved = geoState === 'approved';
+    const geoRejected = geoState === 'rejected';
+    const manualReviewRequired = geoState === 'manual_review_required';
+    const hasDocs = hasAttendanceDocs(attendance);
+    const hasGeoEvidence = hasGeoTagDocs(attendance);
+
+    if (docsApproved && geoApproved && !docsRejected && !geoRejected) return 600;
+    if (docsApproved && manualReviewRequired && !docsRejected) return 500;
+    if (docsApproved && hasGeoEvidence && !docsRejected) return 450;
+    if (docsApproved && !docsRejected) return 420;
+    if (docsRejected || geoRejected) return 300;
+    if (hasDocs && hasGeoEvidence) return 220;
+    if (hasDocs) return 150;
+    if (hasGeoEvidence) return 120;
+    return 0;
+};
+
+const isPreferredAttendanceCandidate = (candidate, current) => {
+    if (!candidate) return false;
+    if (!current) return true;
+
+    const candidateScore = computeAttendanceSelectionScore(candidate);
+    const currentScore = computeAttendanceSelectionScore(current);
+    if (candidateScore !== currentScore) {
+        return candidateScore > currentScore;
+    }
+
+    const candidateTime = toAttendanceEventTime(candidate);
+    const currentTime = toAttendanceEventTime(current);
+    if (candidateTime !== currentTime) {
+        return candidateTime > currentTime;
+    }
+
+    return String(candidate?._id || '') > String(current?._id || '');
 };
 
 const ensureDepartmentsAndSchedules = async (college, preferredDepartmentName = '') => {
@@ -514,23 +685,35 @@ router.get('/:id/details', authenticate, async (req, res) => {
                 }
             });
 
-        // Fetch attendance for each schedule
-        const schedulesWithAttendance = await Promise.all(
-            schedules.map(async (schedule) => {
-                // Strict mapping by scheduleId to avoid cross-day or cross-department mismatches.
-                let attendance = await Attendance.findOne({ scheduleId: schedule._id })
-                    .sort({ createdAt: -1 })
-                    .populate({
-                        path: 'trainerId',
-                        populate: {
-                            path: 'userId',
-                            select: 'name profilePicture'
-                        }
-                    });
+        // Fetch attendance rows for all schedules, then select the most effective row
+        // (approved + geo-approved rows should win over stale pending duplicates).
+        const scheduleIds = schedules.map((schedule) => schedule?._id).filter(Boolean);
+        const attendanceRows = scheduleIds.length
+            ? await Attendance.find({ scheduleId: { $in: scheduleIds } })
+                .sort({ createdAt: -1 })
+                .populate({
+                    path: 'trainerId',
+                    populate: {
+                        path: 'userId',
+                        select: 'name profilePicture'
+                    }
+                })
+            : [];
 
-                return { schedule, attendance };
-            })
-        );
+        const attendanceByScheduleId = new Map();
+        attendanceRows.forEach((attendance) => {
+            const scheduleKey = String(attendance?.scheduleId || '').trim();
+            if (!scheduleKey) return;
+            const current = attendanceByScheduleId.get(scheduleKey);
+            if (isPreferredAttendanceCandidate(attendance, current)) {
+                attendanceByScheduleId.set(scheduleKey, attendance);
+            }
+        });
+
+        const schedulesWithAttendance = schedules.map((schedule) => ({
+            schedule,
+            attendance: attendanceByScheduleId.get(String(schedule?._id || '')) || null,
+        }));
 
         // Transform data to match frontend expectation
         const days = schedulesWithAttendance.map(({ schedule, attendance }) => {
@@ -567,6 +750,7 @@ router.get('/:id/details', authenticate, async (req, res) => {
                 geoTagUploaded: dayUploadStatus.geoTagUploaded,
                 verificationStatus: attendance ? attendance.verificationStatus : 'Pending',
                 geoVerificationStatus: attendance ? attendance.geoVerificationStatus : 'pending',
+                checkOutVerificationStatus: attendance ? attendance.checkOutVerificationStatus : 'pending_checkout',
                 hasAttendanceDocs: hasAttendanceDocs(attendance),
                 hasGeoTagDocs: hasGeoTagDocs(attendance),
                 docsStatusLabel: buildDocsStatusLabel(attendance),
@@ -1008,6 +1192,7 @@ router.put('/:id', authenticate, isSPOCAdmin, async (req, res) => {
         };
 
         await college.save();
+        await syncCollegeLocationToSchedules(college._id, college);
         await ensureDepartmentsAndSchedules(college);
         res.json(college);
     } catch (error) {

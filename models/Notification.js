@@ -38,5 +38,6 @@ const notificationSchema = new mongoose.Schema({
 // Index for efficient querying by user and unread status
 notificationSchema.index({ userId: 1, isRead: 1 });
 notificationSchema.index({ createdAt: -1 });
+notificationSchema.index({ userId: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Notification', notificationSchema);

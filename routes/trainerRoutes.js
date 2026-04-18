@@ -24,10 +24,9 @@ const { generateNdaPdf } = require("../utils/generateNdaPdf");
 const {
   uploadToDrive,
   deleteFromDrive,
-} = require("../services/googleDriveService");
-const {
   ensureTrainerDocumentHierarchy,
-} = require("../services/googleDriveTrainerDocumentHierarchyService");
+  cleanupDuplicateDriveFilesByName,
+} = require("../modules/drive/driveGateway");
 const {
   evaluateTrainerDocumentWorkflow,
   hasCompletedTrainerDetails,
@@ -40,7 +39,10 @@ const {
   normalizeAcceptanceConditions,
   normalizeNdaTemplate,
 } = require("../utils/ndaTemplate");
-const { autoCreateTrainerAdminChannels } = require("../services/streamChatService");
+const {
+  autoCreateTrainerAdminChannels,
+  cleanupDeletedUserChatArtifacts,
+} = require("../services/streamChatService");
 
 const escapeRegex = (value = "") =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -180,6 +182,8 @@ const syncTrainerNdaAgreementPdfToDrive = async (trainer) => {
       originalName: path.basename(pdfPath),
       folderId: trainerDocumentsFolder.id,
       fileName: NDA_DRIVE_FILE_NAME,
+      replaceExistingFile: false,
+      cleanupDuplicateFiles: false,
     });
 
     trainer.documents = trainer.documents || {};
@@ -242,6 +246,19 @@ const syncTrainerNdaAgreementPdfToDrive = async (trainer) => {
         cleanupError.message,
       );
     }
+  }
+
+  try {
+    await cleanupDuplicateDriveFilesByName({
+      folderId: trainerDocumentsFolder.id,
+      fileName: NDA_DRIVE_FILE_NAME,
+      keepFileId: driveUpload.fileId,
+    });
+  } catch (cleanupError) {
+    console.warn(
+      "Failed to clean up older NDA files from Drive:",
+      cleanupError.message,
+    );
   }
 
   return {
@@ -1377,12 +1394,16 @@ router.get("/profile/me", authenticate, async (req, res) => {
       joiningDate: trainer.approvedAt || trainer.createdAt || trainer.userId?.createdAt || null,
       profilePicture: trainer.profilePicture,
       photo:
+        workflow.documentProgress?.selfiePhoto ||
         normalizedTrainer.documents?.selfiePhoto ||
         trainer.profilePicture ||
+        workflow.documentProgress?.passportPhoto ||
         normalizedTrainer.documents?.passportPhoto ||
         trainer.userId?.profilePicture ||
         null,
       documents: normalizedTrainer.documents,
+      documentProgress: workflow.documentProgress,
+      documentChecklist: workflow.checklist,
       agreementAccepted: normalizedTrainer.agreementAccepted,
       agreemeNDAccepted: normalizedTrainer.agreementAccepted,
       ndaAgreementPdf: normalizedTrainer.ndaAgreementPdf,
@@ -1890,12 +1911,15 @@ router.post(
         persistTrainer: true,
       });
       const fileBuffer = await fs.readFile(file.path);
+      const profilePictureDriveFileName = buildProfilePictureDriveFileName(file);
       const driveUpload = await uploadToDrive({
         fileBuffer,
         mimeType: file.mimetype,
         originalName: file.originalname,
         folderId: hierarchy.documentsFolder.id,
-        fileName: buildProfilePictureDriveFileName(file),
+        fileName: profilePictureDriveFileName,
+        replaceExistingFile: false,
+        cleanupDuplicateFiles: false,
       });
 
       trainer.profilePicture = driveUpload.fileUrl;
@@ -1909,6 +1933,19 @@ router.post(
 
       log("SUCCESS: Profile picture saved to database");
       log(`Drive file id: ${driveUpload.fileId}`);
+
+      try {
+        await cleanupDuplicateDriveFilesByName({
+          folderId: hierarchy.documentsFolder.id,
+          fileName: profilePictureDriveFileName,
+          keepFileId: driveUpload.fileId,
+        });
+      } catch (duplicateCleanupError) {
+        console.warn(
+          "[UPLOAD] Failed to clean up older profile picture Drive files:",
+          duplicateCleanupError.message,
+        );
+      }
 
       res.json({
         success: true,
@@ -2273,15 +2310,27 @@ router.delete("/:id", authenticate, async (req, res) => {
       return res.status(403).json({ message: "Access denied." });
     }
 
-    const trainer = await Trainer.findById(req.params.id);
+    const trainer = await Trainer.findById(req.params.id).populate(
+      "userId",
+      "_id name email role profilePicture",
+    );
     if (!trainer) {
       return res
         .status(404)
         .json({ success: false, message: "Trainer not found" });
     }
 
-    if (trainer.userId) {
-      await User.findByIdAndDelete(trainer.userId);
+    if (trainer.userId?._id || trainer.userId) {
+      try {
+        await cleanupDeletedUserChatArtifacts(trainer.userId);
+      } catch (chatCleanupError) {
+        console.warn(
+          "Trainer chat cleanup failed during delete:",
+          chatCleanupError.message,
+        );
+      }
+
+      await User.findByIdAndDelete(trainer.userId?._id || trainer.userId);
     }
 
     await Trainer.findByIdAndDelete(req.params.id);

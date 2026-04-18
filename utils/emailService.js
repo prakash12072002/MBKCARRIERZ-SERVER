@@ -1085,6 +1085,11 @@ const sendAdminSubmissionNotificationEmail = async (
   const toAddress = Array.isArray(adminEmails)
     ? adminEmails.join(",")
     : adminEmails;
+  const frontendUrl = (process.env.FRONTEND_URL || "http://localhost:3000").replace(
+    /\/+$/,
+    "",
+  );
+  const reviewUrl = `${frontendUrl}/dashboard/trainers`;
 
   const mailOptions = {
     from: process.env.EMAIL_FROM || '"MBK BY TSMG" <mbktechnology8@gmail.com>',
@@ -1103,9 +1108,9 @@ const sendAdminSubmissionNotificationEmail = async (
 
                 <p style="text-align: center; margin-top: 24px;">
                     Review:<br/>
-                    <a href="https://mbktechnology.com/admin/trainers" 
+                    <a href="${reviewUrl}" 
                        style="color: #2563eb; font-weight: bold; text-decoration: underline;">
-                        https://mbktechnology.com/admin/trainers
+                        ${reviewUrl}
                     </a>
                 </p>
             </div>
@@ -1298,7 +1303,11 @@ const sendTrainerLogin = async (trainer) => {
   const trainerName = trainer.firstName
     ? `${trainer.firstName} ${trainer.lastName}`
     : trainer.email;
-  const loginUrl = "https://mbktechnology.com/trainner-login";
+  const frontendUrl = (process.env.FRONTEND_URL || "http://localhost:3000").replace(
+    /\/+$/,
+    "",
+  );
+  const loginUrl = `${frontendUrl}/login`;
 
   const mailOptions = {
     from: process.env.EMAIL_FROM || '"MBK BY TSMG" <mbktechnology8@gmail.com>',

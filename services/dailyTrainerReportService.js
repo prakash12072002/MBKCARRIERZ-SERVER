@@ -11,9 +11,15 @@ const {
 const { sendMail } = require("../utils/emailService");
 const dailyTrainerReportEmail = require("../utils/dailyTrainerReportEmail");
 const generateReportPDF = require("../utils/generateReportPDF");
+const {
+  enqueueFileWorkflowJob,
+  registerFileWorkflowJobHandler,
+} = require("../jobs/queues/fileWorkflowQueue");
+const { FILE_WORKFLOW_JOB_TYPES } = require("../jobs/fileWorkflowJobTypes");
 
 const COMPLETED_SCHEDULE_STATUSES = new Set(["completed", "COMPLETED"]);
 const ACTIVE_ATTENDANCE_STATUSES = new Set(["Present", "Late"]);
+let dailyReportWorkerRegistered = false;
 
 const getDayRange = (dateRef = dayjs()) => ({
   dayStart: dayjs(dateRef).startOf("day").toDate(),
@@ -101,7 +107,126 @@ const buildCompanyReport = async (company, dateRef = dayjs()) => {
   };
 };
 
+const processCompanyDailyTrainerReport = async ({
+  companyId,
+  dateRef = dayjs(),
+}) => {
+  const company = await Company.findById(companyId)
+    .select("_id name companyCode email adminId isActive status")
+    .lean();
+
+  if (!company) {
+    console.warn("[DAILY-REPORT] Skipped missing company:", companyId);
+    return { sent: false, reason: "company_missing" };
+  }
+
+  if (
+    company.isActive === false ||
+    !["active", "Active"].includes(String(company.status || ""))
+  ) {
+    return { sent: false, reason: "company_inactive", companyName: company.name };
+  }
+
+  let tempFilePath = null;
+  try {
+    let recipientEmail = company.email || null;
+
+    if (!recipientEmail && company.adminId) {
+      const admin = await User.findById(company.adminId).select("email").lean();
+      recipientEmail = admin?.email || null;
+    }
+
+    if (!recipientEmail) {
+      console.log(`[DAILY-REPORT] Skipped ${company.name}: no contact email`);
+      return { sent: false, reason: "missing_recipient", companyName: company.name };
+    }
+
+    const reportDateLabel = dayjs(dateRef).format("DD MMM YYYY");
+    const metrics = await buildCompanyReport(company, dateRef);
+    const subject = `MBK Daily Trainer Activity Report - ${reportDateLabel}`;
+    const text = [
+      `Company: ${company.name}`,
+      `Date: ${reportDateLabel}`,
+      `Total Trainers: ${metrics.totalTrainers}`,
+      `Active Today: ${metrics.activeToday}`,
+      `Completed Sessions: ${metrics.completedSessions}`,
+      `Pending Attendance: ${metrics.pendingAttendance}`,
+    ].join("\n");
+
+    const fileName = `DailyReport-${company.companyCode || company._id}-${dayjs(dateRef).format("YYYYMMDD")}.pdf`;
+    tempFilePath = await generateReportPDF(
+      {
+        companyName: company.name,
+        date: reportDateLabel,
+        totalTrainers: metrics.totalTrainers,
+        activeToday: metrics.activeToday,
+        completedSessions: metrics.completedSessions,
+        pendingAttendance: metrics.pendingAttendance,
+      },
+      fileName,
+    );
+
+    await sendMail(
+      recipientEmail,
+      subject,
+      text,
+      dailyTrainerReportEmail({
+        companyName: company.name,
+        date: reportDateLabel,
+        totalTrainers: metrics.totalTrainers,
+        activeToday: metrics.activeToday,
+        completedSessions: metrics.completedSessions,
+        pendingAttendance: metrics.pendingAttendance,
+      }),
+      [
+        {
+          filename: fileName,
+          path: tempFilePath,
+        },
+      ],
+    );
+
+    console.log(`[DAILY-REPORT] Sent: ${company.name} -> ${recipientEmail}`);
+    return { sent: true, companyName: company.name, recipientEmail };
+  } catch (error) {
+    console.error(
+      `[DAILY-REPORT] Failed for ${company?.name || "Unknown Company"}:`,
+      error.message,
+    );
+    throw error;
+  } finally {
+    if (tempFilePath) {
+      try {
+        await fs.unlink(tempFilePath);
+      } catch (cleanupError) {
+        console.error(
+          `[DAILY-REPORT] Temp file cleanup failed (${tempFilePath}):`,
+          cleanupError.message,
+        );
+      }
+    }
+  }
+};
+
+const ensureDailyReportWorkerRegistration = () => {
+  if (dailyReportWorkerRegistered) return;
+
+  registerFileWorkflowJobHandler(
+    FILE_WORKFLOW_JOB_TYPES.DAILY_REPORT_EMAIL,
+    async (payload = {}) => {
+      const parsedDate = payload.dateIso ? dayjs(payload.dateIso) : dayjs();
+      await processCompanyDailyTrainerReport({
+        companyId: payload.companyId,
+        dateRef: parsedDate.isValid() ? parsedDate : dayjs(),
+      });
+    },
+  );
+
+  dailyReportWorkerRegistered = true;
+};
+
 const sendDailyTrainerReports = async (dateRef = dayjs()) => {
+  ensureDailyReportWorkerRegistration();
   const reportDateLabel = dayjs(dateRef).format("DD MMM YYYY");
   console.log(`[DAILY-REPORT] Running daily trainer report for ${reportDateLabel}`);
 
@@ -112,84 +237,33 @@ const sendDailyTrainerReports = async (dateRef = dayjs()) => {
     .select("_id name companyCode email adminId")
     .lean();
 
+  const queueResults = [];
   for (const company of companies) {
-    let tempFilePath = null;
     try {
-      let recipientEmail = company.email || null;
-
-      if (!recipientEmail && company.adminId) {
-        const admin = await User.findById(company.adminId).select("email").lean();
-        recipientEmail = admin?.email || null;
-      }
-
-      if (!recipientEmail) {
-        console.log(`[DAILY-REPORT] Skipped ${company.name}: no coNDAct email`);
-        continue;
-      }
-
-      const metrics = await buildCompanyReport(company, dateRef);
-      const subject = `MBK Daily Trainer Activity Report - ${reportDateLabel}`;
-      const text = [
-        `Company: ${company.name}`,
-        `Date: ${reportDateLabel}`,
-        `Total Trainers: ${metrics.totalTrainers}`,
-        `Active Today: ${metrics.activeToday}`,
-        `Completed Sessions: ${metrics.completedSessions}`,
-        `Pending Attendance: ${metrics.pendingAttendance}`,
-      ].join("\n");
-
-      const fileName = `DailyReport-${company.companyCode || company._id}-${dayjs(dateRef).format("YYYYMMDD")}.pdf`;
-      tempFilePath = await generateReportPDF(
-        {
-          companyName: company.name,
-          date: reportDateLabel,
-          totalTrainers: metrics.totalTrainers,
-          activeToday: metrics.activeToday,
-          completedSessions: metrics.completedSessions,
-          pendingAttendance: metrics.pendingAttendance,
+      const queueResult = await enqueueFileWorkflowJob({
+        type: FILE_WORKFLOW_JOB_TYPES.DAILY_REPORT_EMAIL,
+        payload: {
+          companyId: String(company._id),
+          dateIso: dayjs(dateRef).toISOString(),
         },
-        fileName,
-      );
-
-      await sendMail(
-        recipientEmail,
-        subject,
-        text,
-        dailyTrainerReportEmail({
-          companyName: company.name,
-          date: reportDateLabel,
-          totalTrainers: metrics.totalTrainers,
-          activeToday: metrics.activeToday,
-          completedSessions: metrics.completedSessions,
-          pendingAttendance: metrics.pendingAttendance,
-        }),
-        [
-          {
-            filename: fileName,
-            path: tempFilePath,
-          },
-        ],
-      );
-
-      console.log(`[DAILY-REPORT] Sent: ${company.name} -> ${recipientEmail}`);
+        maxAttempts: 3,
+      });
+      queueResults.push(queueResult);
     } catch (error) {
       console.error(
-        `[DAILY-REPORT] Failed for ${company?.name || "Unknown Company"}:`,
+        `[DAILY-REPORT] Failed to queue report for ${company?.name || "Unknown Company"}:`,
         error.message,
       );
-    } finally {
-      if (tempFilePath) {
-        try {
-          await fs.unlink(tempFilePath);
-        } catch (cleanupError) {
-          console.error(
-            `[DAILY-REPORT] Temp file cleanup failed (${tempFilePath}):`,
-            cleanupError.message,
-          );
-        }
-      }
     }
   }
+
+  console.log(
+    `[DAILY-REPORT] Queued ${queueResults.length} company jobs for ${reportDateLabel}`,
+  );
+  return {
+    queued: queueResults.length,
+    total: companies.length,
+  };
 };
 
 const init = () => {
@@ -215,4 +289,5 @@ module.exports = {
   init,
   sendDailyTrainerReports,
   buildCompanyReport,
+  processCompanyDailyTrainerReport,
 };

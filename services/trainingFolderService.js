@@ -12,7 +12,7 @@ const {
   ensureDepartmentHierarchy,
   isTrainingDriveEnabled,
   toDepartmentDayFolders,
-} = require("./googleDriveTrainingHierarchyService");
+} = require("../modules/drive/driveGateway");
 
 const DEFAULT_DAY_COUNT = Math.max(
   1,

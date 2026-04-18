@@ -9,7 +9,10 @@
     "seed": "node scripts/seed-channels.js",
     "drive:smoke": "node scripts/drive-smoke-test.js",
     "drive:audit": "node scripts/drive-audit.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "npm run test:unit && npm run test:api && npm run test:e2e",
+    "test:unit": "node tests/unit/run-unit-tests.mjs",
+    "test:api": "node tests/api/run-api-tests.mjs",
+    "test:e2e": "node tests/e2e/run-e2e-tests.mjs"
   },
   "keywords": [],
   "author": "",
@@ -53,6 +56,7 @@
     "socket.io": "^4.8.1",
     "stream-chat": "^9.36.0",
     "svg-captcha": "^1.4.0",
+    "tesseract.js": "^7.0.0",
     "twilio": "^5.12.0",
     "xlsx": "^0.18.5"
   }

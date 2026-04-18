@@ -6,10 +6,11 @@ const { CompanyInvite, Otp, Company, User, CompanyArchive } = require("../models
 const { sendMail } = require("../utils/emailService");
 const inviteEmailTemplate = require("../utils/inviteEmailTemplate");
 const companyActivatedEmail = require("../utils/companyActivatedEmail");
+const { uploadCompanyLogoToDrive } = require("../utils/companyLogoUpload");
 const {
   ensureCompanyHierarchy,
   isTrainingDriveEnabled,
-} = require("../services/googleDriveTrainingHierarchyService");
+} = require("../modules/drive/driveGateway");
 
 const router = express.Router();
 
@@ -17,6 +18,44 @@ const isSuperAdmin = (user) =>
   String(user?.role || "").toLowerCase() === "superadmin";
 const isCompanyAdminRole = (role) =>
   ["companyadmin", "CompanyAdmin"].includes(String(role || ""));
+
+const createSystemGeneratedPassword = () =>
+  `MBK#${crypto.randomBytes(24).toString("hex")}`;
+
+const getStoredLogoPath = (file) => {
+  if (!file) return null;
+
+  const directUrl = file.path || file.secure_url || file.url;
+  if (typeof directUrl === "string" && /^https?:\/\//i.test(directUrl)) {
+    return directUrl;
+  }
+
+  if (file.filename) {
+    return `/uploads/trainer-documents/${file.filename}`;
+  }
+
+  if (typeof directUrl === "string") {
+    const normalized = directUrl.replace(/\\/g, "/");
+    const marker = "/uploads/";
+    const markerIndex = normalized.toLowerCase().lastIndexOf(marker);
+    if (markerIndex >= 0) {
+      return normalized.slice(markerIndex);
+    }
+  }
+
+  return null;
+};
+
+const processOptionalLogoUpload = (req, res) =>
+  new Promise((resolve) => {
+    upload.single("logo")(req, res, (error) => {
+      if (error) {
+        req.logoUploadError = error;
+        req.file = null;
+      }
+      resolve();
+    });
+  });
 
 // STEP 1: Super Admin sends invite after OTP verification
 router.post("/", authenticate, async (req, res) => {
@@ -158,8 +197,9 @@ router.get("/:token", async (req, res) => {
 });
 
 // STEP 2: Company onboarding completion by mail holder
-router.post("/complete", upload.single("logo"), async (req, res) => {
+router.post("/complete", async (req, res) => {
   try {
+    await processOptionalLogoUpload(req, res);
     const { token, companyName, phone, address, adminName } = req.body;
 
     if (!token || !companyName || !phone || !address || !adminName) {
@@ -199,6 +239,14 @@ router.post("/complete", upload.single("logo"), async (req, res) => {
       });
     }
 
+    const logoUploadWarning = req.logoUploadError
+      ? "Company was created without logo because logo upload failed."
+      : null;
+    if (req.logoUploadError) {
+      console.error("company-invite logo upload warning:", req.logoUploadError);
+    }
+    const storedLogoPath = getStoredLogoPath(req.file);
+
     const company = await Company.create({
       name: companyName,
       adminName,
@@ -206,20 +254,39 @@ router.post("/complete", upload.single("logo"), async (req, res) => {
       phone,
       address,
       status: "active",
-      ...(req.file?.path ? { logo: req.file.path } : {}),
+      ...(storedLogoPath ? { logo: storedLogoPath } : {}),
     });
+    let companyHierarchy = null;
     if (isTrainingDriveEnabled()) {
       try {
-        const hierarchy = await ensureCompanyHierarchy({ company });
-        if (hierarchy?.companyFolder?.id) {
-          company.driveFolderId = hierarchy.companyFolder.id;
-          company.driveFolderName = hierarchy.companyFolder.name;
-          company.driveFolderLink = hierarchy.companyFolder.link;
+        companyHierarchy = await ensureCompanyHierarchy({ company });
+        if (companyHierarchy?.companyFolder?.id) {
+          company.driveFolderId = companyHierarchy.companyFolder.id;
+          company.driveFolderName = companyHierarchy.companyFolder.name;
+          company.driveFolderLink = companyHierarchy.companyFolder.link;
         }
       } catch (driveError) {
         console.error(
           "[GOOGLE-DRIVE] Failed to create company folder during invite completion:",
           driveError.message,
+        );
+      }
+    }
+
+    if (req.file && isTrainingDriveEnabled()) {
+      try {
+        const logoDriveUpload = await uploadCompanyLogoToDrive({
+          file: req.file,
+          company,
+          hierarchy: companyHierarchy,
+        });
+        if (logoDriveUpload?.logoUrl) {
+          company.logo = logoDriveUpload.logoUrl;
+        }
+      } catch (driveLogoError) {
+        console.error(
+          "[GOOGLE-DRIVE] Failed to upload company logo during invite completion:",
+          driveLogoError.message,
         );
       }
     }
@@ -230,6 +297,7 @@ router.post("/complete", upload.single("logo"), async (req, res) => {
       user = await User.create({
         name: adminName,
         email: invite.email,
+        password: createSystemGeneratedPassword(),
         role: "CompanyAdmin",
         companyId: company._id, // primary company for existing code paths
         companyIds: [company._id],
@@ -250,8 +318,9 @@ router.post("/complete", upload.single("logo"), async (req, res) => {
       user.isEmailVerified = true;
       user.accountStatus = "active";
       user.isActive = true;
-      user.password = undefined;
-      user.plainPassword = undefined;
+      if (!String(user.password || "").trim()) {
+        user.password = createSystemGeneratedPassword();
+      }
 
       await user.save();
     }
@@ -291,6 +360,7 @@ router.post("/complete", upload.single("logo"), async (req, res) => {
     return res.json({
       success: true,
       message: "Company created successfully",
+      ...(logoUploadWarning ? { warning: logoUploadWarning } : {}),
       company: {
         id: company._id,
         name: company.name,
@@ -301,7 +371,7 @@ router.post("/complete", upload.single("logo"), async (req, res) => {
     console.error("company-invite complete error:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to complete onboarding",
+      message: error?.message || "Failed to complete onboarding",
     });
   }
 });

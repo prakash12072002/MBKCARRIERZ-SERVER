@@ -100,6 +100,11 @@ const complaintSchema = new mongoose.Schema({
     timestamps: true
 });
 
+complaintSchema.index({ trainerId: 1, createdAt: -1 });
+complaintSchema.index({ assignedTo: 1, status: 1, createdAt: -1 });
+complaintSchema.index({ category: 1, status: 1, createdAt: -1 });
+complaintSchema.index({ status: 1, createdAt: -1 });
+
 const Complaint = mongoose.model('Complaint', complaintSchema);
 
 module.exports = Complaint;

@@ -4,20 +4,84 @@ const xlsx = require('xlsx');
 const fs = require('fs');
 const path = require('path');
 const mongoose = require('mongoose');
-const { uploadAttendance, uploadManual } = require('../config/upload');
-const { Attendance, Trainer, College, Schedule, User, Student, Notification, Department, ScheduleDocument } = require('../models');
+const {
+    uploadAttendance,
+    uploadManual,
+    uploadGeoImage,
+    GEO_IMAGE_MAX_SIZE_MB,
+} = require('../config/upload');
+const {
+    Attendance,
+    Trainer,
+    College,
+    Company,
+    Course,
+    Schedule,
+    User,
+    Student,
+    Notification,
+    Department,
+    ScheduleDocument
+} = require('../models');
 const { sendTrainingCompletionEmail } = require('../utils/emailService');
 const { getGeoTagData } = require('../utils/exif');
+const { extractOcrStampData } = require('../utils/ocr');
 const { verifyGeoTag } = require('../utils/verify');
-const { sendNotification } = require('../services/notificationService');
-const { uploadToDriveWithRetry, ensureDriveFolder } = require('../services/googleDriveService');
 const {
+    normalizeCollegeLocation,
+    hasValidCollegeCoordinates,
+    mergeCollegeLocations,
+    collegeLocationsEqual,
+} = require('../utils/collegeLocation');
+const { sendNotification } = require('../services/notificationService');
+const {
+    uploadToDriveWithRetry,
+    ensureDriveFolder,
     isTrainingDriveEnabled,
     ensureTrainingRootFolder,
     ensureDepartmentHierarchy,
     toDepartmentDayFolders,
-} = require('../services/googleDriveTrainingHierarchyService');
+} = require('../modules/drive/driveGateway');
+const {
+    DRIVE_DAY_SUBFOLDERS,
+    buildScheduleFolderFields,
+} = require('../modules/drive/driveFolderResolver');
+const {
+    normalizeAttendanceVerificationStatus,
+    normalizeAttendancePresenceStatus,
+    normalizeAttendanceFinalStatus,
+    normalizeCheckOutVerificationStatus,
+} = require('../utils/statusNormalizer');
 const haversine = require('haversine-distance');
+const { invalidateTrainerScheduleCaches } = require('../services/trainerScheduleCacheService');
+const {
+    enqueueFileWorkflowJob,
+    registerFileWorkflowJobHandler,
+} = require('../jobs/queues/fileWorkflowQueue');
+const { FILE_WORKFLOW_JOB_TYPES } = require('../jobs/fileWorkflowJobTypes');
+const {
+    createCorrelationId,
+    createStructuredLogger,
+} = require('../shared/utils/structuredLogger');
+const {
+    getAttendanceScheduleController,
+    getAttendanceLegacyDetailsController,
+    getAttendanceTrainerController,
+    getAttendanceCollegeController,
+    getAttendanceDocumentsController,
+    createVerifyAttendanceDocumentController,
+    createRejectAttendanceDocumentController,
+    createMarkManualAttendanceController,
+    verifyGeoTagController,
+    rejectGeoTagController,
+} = require('../modules/attendance/attendance.controller');
+
+const {
+    syncScheduleDayState,
+    emitAttendanceRealtimeUpdate,
+    syncScheduleLifecycleStatusFromAttendance,
+    normalizeVerificationStatus,
+} = require('../modules/attendance/attendance.sideeffects');
 
 const ALLOWED_GEO_RANGE_METERS = Math.max(
     0,
@@ -43,11 +107,6 @@ const DRIVE_DEFAULT_MIME_BY_EXT = {
     '.wmv': 'video/x-ms-wmv'
 };
 
-const DRIVE_DAY_SUBFOLDERS = {
-    attendance: 'Attendance',
-    geoTag: 'GeoTag'
-};
-
 const GEO_TAG_FILE_FIELDS = new Set([
     'studentsPhoto',
     'signature',
@@ -60,6 +119,85 @@ const GEO_TAG_FILE_FIELDS = new Set([
     'activityVideos',
     'checkOutSignature'
 ]);
+
+let attendanceAsyncLogger;
+try {
+    attendanceAsyncLogger = createStructuredLogger({
+        service: 'attendance',
+        component: 'drive-sync',
+    });
+} catch (e) {
+    console.warn('Attendance Async Logger failed to initialize:', e.message);
+    attendanceAsyncLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+}
+
+const logAttendanceAsyncTelemetry = (level, fields = {}) => {
+    try {
+        const method = typeof attendanceAsyncLogger[level] === 'function' ? level : 'info';
+        attendanceAsyncLogger[method]({
+            correlationId: fields.correlationId || null,
+            stage: fields.stage || null,
+            trainerId: fields.trainerId || null,
+            documentId: fields.documentId || null,
+            scheduleId: fields.scheduleId || null,
+            attendanceId: fields.attendanceId || null,
+            status: fields.status || null,
+            attempt: Number.isFinite(fields.attempt) ? fields.attempt : null,
+            outcome: fields.outcome || null,
+            cleanupMode: fields.cleanupMode || null,
+            reason: fields.reason || null,
+            contextLabel: fields.contextLabel || null,
+        });
+    } catch (err) {
+        console.warn('Telemetry logging failed:', err.message);
+    }
+};
+
+const persistResolvedScheduleCollegeLocation = async (schedule, resolvedCollegeLocation) => {
+    if (!schedule?._id || !resolvedCollegeLocation) return;
+
+    const normalizedScheduleLocation = normalizeCollegeLocation(schedule.collegeLocation);
+    if (collegeLocationsEqual(normalizedScheduleLocation, resolvedCollegeLocation)) return;
+
+    try {
+        await Schedule.updateOne(
+            { _id: schedule._id },
+            { $set: { collegeLocation: resolvedCollegeLocation } }
+        );
+        schedule.collegeLocation = resolvedCollegeLocation;
+    } catch (error) {
+        logAttendanceAsyncTelemetry('warn', {
+            correlationId: createCorrelationId('attendance_geo'),
+            stage: 'schedule_college_location_sync_failed',
+            scheduleId: schedule?._id ? String(schedule._id) : null,
+            status: 'location_sync',
+            outcome: 'failed',
+            reason: error.message,
+        });
+    }
+};
+
+const resolveScheduleCollegeLocation = async (schedule) => {
+    const normalizedScheduleLocation = normalizeCollegeLocation(schedule?.collegeLocation);
+
+    if (!schedule?.collegeId) {
+        return normalizedScheduleLocation;
+    }
+
+    const college = await College.findById(schedule.collegeId)
+        .select('address mapUrl latitude longitude location');
+    const normalizedCollegeLocation = normalizeCollegeLocation(college);
+    const resolvedCollegeLocation = mergeCollegeLocations(
+        normalizedCollegeLocation,
+        normalizedScheduleLocation
+    );
+
+    if (resolvedCollegeLocation) {
+        await persistResolvedScheduleCollegeLocation(schedule, resolvedCollegeLocation);
+    }
+
+    return resolvedCollegeLocation;
+};
 
 const getFileMimeType = (file) => {
     if (file?.mimetype) return file.mimetype;
@@ -132,6 +270,159 @@ const markDriveSyncError = (existingAssets, error) => {
 const resolveDriveSubFolderType = (fieldName) =>
     GEO_TAG_FILE_FIELDS.has(fieldName) ? 'geoTag' : 'attendance';
 
+const DEFAULT_ATTENDANCE_PAGE_LIMIT = 20;
+const MAX_ATTENDANCE_PAGE_LIMIT = 100;
+const ATTENDANCE_LIST_CHECK_OUT_SELECT_FIELDS = [
+    'checkOut.time',
+    'checkOut.finalStatus',
+    'checkOut.location.lat',
+    'checkOut.location.lng',
+    'checkOut.location.accuracy',
+    'checkOut.location.address',
+    'checkOut.location.distanceFromCollege',
+    'checkOut.photos.url',
+    'checkOut.photos.uploadedAt',
+    'checkOut.photos.validationStatus',
+    'checkOut.photos.validationReason',
+    'checkOut.photos.latitude',
+    'checkOut.photos.longitude',
+    'checkOut.photos.capturedAt',
+    'checkOut.photos.distanceKm',
+    'checkOut.photos.validationSource',
+];
+
+const escapeRegex = (value = '') =>
+    String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const parsePositiveInteger = (value, fallback) => {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const parseAttendanceDateBoundary = (value, boundary = 'start') => {
+    const normalized = String(value || '').trim();
+    if (!normalized) {
+        return null;
+    }
+
+    const parsedDate = new Date(normalized);
+    if (Number.isNaN(parsedDate.getTime())) {
+        return null;
+    }
+
+    if (boundary === 'end') {
+        parsedDate.setHours(23, 59, 59, 999);
+    } else {
+        parsedDate.setHours(0, 0, 0, 0);
+    }
+
+    return parsedDate;
+};
+
+const shouldPaginateAttendance = (query = {}) =>
+    Object.prototype.hasOwnProperty.call(query, 'page')
+    || Object.prototype.hasOwnProperty.call(query, 'limit');
+
+const buildAttendanceSearchFilters = async (search = '') => {
+    const normalizedSearch = String(search || '').trim();
+    if (!normalizedSearch) {
+        return [];
+    }
+
+    const regex = new RegExp(escapeRegex(normalizedSearch), 'i');
+
+    const [users, trainers, companies, colleges, courses, schedules] = await Promise.all([
+        User.find({
+            $or: [
+                { name: regex },
+                { email: regex }
+            ]
+        }).select('_id').lean(),
+        Trainer.find({
+            $or: [
+                { name: regex },
+                { email: regex },
+                { trainerId: regex }
+            ]
+        }).select('_id').lean(),
+        Company.find({ name: regex }).select('_id').lean(),
+        College.find({ name: regex }).select('_id').lean(),
+        Course.find({
+            $or: [
+                { name: regex },
+                { title: regex }
+            ]
+        }).select('_id').lean(),
+        Schedule.find({ subject: regex }).select('_id').lean(),
+    ]);
+
+    const userIds = users.map((item) => item._id);
+    const directTrainerIds = trainers.map((item) => item._id);
+    const companyIds = companies.map((item) => item._id);
+    const directCollegeIds = colleges.map((item) => item._id);
+    const courseIds = courses.map((item) => item._id);
+    const directScheduleIds = schedules.map((item) => item._id);
+
+    let trainerIds = directTrainerIds;
+    if (userIds.length) {
+        const trainersByUser = await Trainer.find({
+            userId: { $in: userIds }
+        }).select('_id').lean();
+        trainerIds = Array.from(
+            new Set([
+                ...directTrainerIds.map(String),
+                ...trainersByUser.map((item) => String(item._id))
+            ])
+        ).map((value) => new mongoose.Types.ObjectId(value));
+    }
+
+    let collegeIds = directCollegeIds;
+    if (companyIds.length) {
+        const collegesByCompany = await College.find({
+            companyId: { $in: companyIds }
+        }).select('_id').lean();
+        collegeIds = Array.from(
+            new Set([
+                ...directCollegeIds.map(String),
+                ...collegesByCompany.map((item) => String(item._id))
+            ])
+        ).map((value) => new mongoose.Types.ObjectId(value));
+    }
+
+    let scheduleIds = directScheduleIds;
+    if (courseIds.length) {
+        const schedulesByCourse = await Schedule.find({
+            courseId: { $in: courseIds }
+        }).select('_id').lean();
+        scheduleIds = Array.from(
+            new Set([
+                ...directScheduleIds.map(String),
+                ...schedulesByCourse.map((item) => String(item._id))
+            ])
+        ).map((value) => new mongoose.Types.ObjectId(value));
+    }
+
+    const filters = [{ syllabus: regex }];
+
+    if (trainerIds.length) {
+        filters.push({ trainerId: { $in: trainerIds } });
+    }
+
+    if (collegeIds.length) {
+        filters.push({ collegeId: { $in: collegeIds } });
+    }
+
+    if (courseIds.length) {
+        filters.push({ courseId: { $in: courseIds } });
+    }
+
+    if (scheduleIds.length) {
+        filters.push({ scheduleId: { $in: scheduleIds } });
+    }
+
+    return filters;
+};
+
 const toScheduleDocumentFileType = (folderType) => {
     const normalizedType = String(folderType || '').trim().toLowerCase();
     if (normalizedType === String(DRIVE_DAY_SUBFOLDERS.geoTag).toLowerCase()) return 'geotag';
@@ -140,7 +431,7 @@ const toScheduleDocumentFileType = (folderType) => {
 };
 
 const toScheduleDocumentStatus = (status) => {
-    const normalizedStatus = String(status || '').trim().toLowerCase();
+    const normalizedStatus = normalizeAttendanceVerificationStatus(status, 'pending');
     if (normalizedStatus === 'approved') return 'verified';
     if (normalizedStatus === 'rejected') return 'rejected';
     return 'pending';
@@ -196,12 +487,13 @@ const toIdString = (value) => {
     if (!value) return '';
     if (typeof value === 'string') return value.trim();
     if (typeof value === 'object') {
-        if (value._id) return String(value._id).trim();
-        if (value.id) return String(value.id).trim();
-        if (value.$oid) return String(value.$oid).trim();
+        // Handle Mongoose ObjectId vs standard object vs populated nested forms
+        const idValue = value._id || value.id || value.$oid || (typeof value.toString === 'function' ? value.toString() : null);
+        if (idValue && typeof idValue === 'string') return idValue.trim();
+        if (idValue && typeof idValue === 'object') return String(idValue).trim();
     }
     const normalized = String(value).trim();
-    return normalized === '[object Object]' ? '' : normalized;
+    return (normalized === '[object Object]' || normalized === 'undefined' || normalized === 'null') ? '' : normalized;
 };
 
 const buildPendingCheckOutImageSlot = () => ({
@@ -221,7 +513,256 @@ const buildPendingCheckOutPhotoSlot = () => ({
     longitude: null,
     capturedAt: null,
     distanceKm: null,
+    validationSource: null,
+    verificationReport: null,
 });
+
+const buildVerificationReportPayload = (validation) => {
+    if (!validation?.report || typeof validation.report !== 'object') return null;
+
+    const report = validation.report;
+    const exifTimestamp = Number.isFinite(report?.exif?.timestamp)
+        ? new Date(report.exif.timestamp * 1000)
+        : null;
+    const ocrTimestamp = Number.isFinite(report?.ocr?.timestamp)
+        ? new Date(report.ocr.timestamp * 1000)
+        : null;
+
+    return {
+        source: report.source || validation.validationSource || null,
+        reason: validation.reason || null,
+        reasonCode: validation.reasonCode || null,
+        missingFields: Array.isArray(validation.missingFields) ? validation.missingFields : [],
+        exif: {
+            latitude: Number.isFinite(report?.exif?.latitude) ? report.exif.latitude : null,
+            longitude: Number.isFinite(report?.exif?.longitude) ? report.exif.longitude : null,
+            capturedAt: exifTimestamp && !Number.isNaN(exifTimestamp.getTime()) ? exifTimestamp : null,
+        },
+        ocr: {
+            latitude: Number.isFinite(report?.ocr?.latitude) ? report.ocr.latitude : null,
+            longitude: Number.isFinite(report?.ocr?.longitude) ? report.ocr.longitude : null,
+            capturedAt: ocrTimestamp && !Number.isNaN(ocrTimestamp.getTime()) ? ocrTimestamp : null,
+            text: report?.ocr?.text || null,
+        },
+        comparisons: {
+            geoMatch: typeof report?.comparisons?.geoMatch === 'boolean' ? report.comparisons.geoMatch : null,
+            timeMatch: typeof report?.comparisons?.timeMatch === 'boolean' ? report.comparisons.timeMatch : null,
+            distanceKm: Number.isFinite(report?.comparisons?.distanceKm) ? report.comparisons.distanceKm : null,
+            collegeLatitude: report?.comparisons?.collegeLatitude ?? null,
+            collegeLongitude: report?.comparisons?.collegeLongitude ?? null,
+            assignedDate: report?.comparisons?.assignedDate || null,
+            detectedDate: report?.comparisons?.detectedDate || null,
+        },
+    };
+};
+
+const CHECK_OUT_REQUIRED_IMAGE_COUNT = 3;
+const CHECK_OUT_ALLOWED_RANGE_KM = CHECK_OUT_ALLOWED_GEO_RANGE_METERS / 1000;
+
+const toDateOrNull = (value) => {
+    if (!value) return null;
+    const parsed = value instanceof Date ? value : new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+const toCheckOutEvidenceItem = ({
+    status = 'PENDING',
+    reason = null,
+    report = null,
+    distanceKm = null,
+    latitude = null,
+    longitude = null,
+    capturedAt = null,
+} = {}) => {
+    const normalizedStatus = String(status || '').trim().toUpperCase();
+    const exifLatitude = Number.isFinite(report?.exif?.latitude) ? report.exif.latitude : null;
+    const exifLongitude = Number.isFinite(report?.exif?.longitude) ? report.exif.longitude : null;
+    const exifCapturedAt = toDateOrNull(report?.exif?.capturedAt);
+    const assignedDate = String(report?.comparisons?.assignedDate || '').trim() || null;
+    const detectedDate = String(report?.comparisons?.detectedDate || '').trim() || null;
+    const resolvedDistanceKm = Number.isFinite(distanceKm)
+        ? distanceKm
+        : (Number.isFinite(report?.comparisons?.distanceKm) ? report.comparisons.distanceKm : null);
+    const resolvedLatitude = Number.isFinite(latitude)
+        ? latitude
+        : (Number.isFinite(report?.ocr?.latitude) ? report.ocr.latitude : null);
+    const resolvedLongitude = Number.isFinite(longitude)
+        ? longitude
+        : (Number.isFinite(report?.ocr?.longitude) ? report.ocr.longitude : null);
+    const resolvedCapturedAt = toDateOrNull(capturedAt)
+        || toDateOrNull(report?.ocr?.capturedAt)
+        || exifCapturedAt;
+    const distanceMeters = Number.isFinite(resolvedDistanceKm)
+        ? resolvedDistanceKm * 1000
+        : null;
+
+    return {
+        completed: normalizedStatus === 'COMPLETED' || normalizedStatus === 'VERIFIED',
+        reason: String(reason || '').trim() || null,
+        exifLatitude,
+        exifLongitude,
+        exifCapturedAt,
+        latitude: resolvedLatitude,
+        longitude: resolvedLongitude,
+        capturedAt: resolvedCapturedAt,
+        distanceMeters,
+        dateMatched: assignedDate && detectedDate
+            ? assignedDate === detectedDate
+            : null,
+        radiusMatched: Number.isFinite(distanceMeters)
+            ? distanceMeters <= CHECK_OUT_ALLOWED_GEO_RANGE_METERS
+            : null,
+    };
+};
+
+const buildCheckOutVerificationResult = ({
+    evidenceItems = [],
+    fallbackReasons = [],
+}) => {
+    const normalizedEvidence = Array.isArray(evidenceItems)
+        ? evidenceItems.filter(Boolean)
+        : [];
+    const normalizedFallbackReasons = Array.isArray(fallbackReasons)
+        ? fallbackReasons.filter(Boolean).map((item) => String(item).trim())
+        : [];
+
+    const collectedReasons = [...normalizedFallbackReasons];
+    const uniqueReasonSet = new Set();
+    const collectReason = (value) => {
+        const normalized = String(value || '').trim();
+        if (!normalized || uniqueReasonSet.has(normalized)) return;
+        uniqueReasonSet.add(normalized);
+        collectedReasons.push(normalized);
+    };
+
+    if (normalizedEvidence.length < CHECK_OUT_REQUIRED_IMAGE_COUNT) {
+        collectReason(`Awaiting ${CHECK_OUT_REQUIRED_IMAGE_COUNT} checkout images`);
+        return {
+            status: normalizeCheckOutVerificationStatus('pending_checkout'),
+            reason: collectedReasons.join(' ') || null,
+            capturedAt: null,
+            latitude: null,
+            longitude: null,
+            distanceMeters: null,
+        };
+    }
+
+    const missingExifIndexes = [];
+    const incompleteIndexes = [];
+    const dateMismatchIndexes = [];
+    const radiusMismatchIndexes = [];
+
+    normalizedEvidence.forEach((item, index) => {
+        const oneBased = index + 1;
+        const hasExif =
+            Number.isFinite(item?.exifLatitude)
+            && Number.isFinite(item?.exifLongitude)
+            && item?.exifCapturedAt instanceof Date;
+
+        if (!item?.completed) {
+            incompleteIndexes.push(oneBased);
+            collectReason(item?.reason || `Image ${oneBased}: validation incomplete`);
+        }
+
+        if (!hasExif) {
+            missingExifIndexes.push(oneBased);
+            collectReason(`Image ${oneBased}: missing EXIF date/latitude/longitude metadata`);
+        }
+
+        if (item?.dateMatched !== true) {
+            dateMismatchIndexes.push(oneBased);
+            collectReason(`Image ${oneBased}: schedule date mismatch`);
+        }
+
+        if (item?.radiusMatched !== true) {
+            radiusMismatchIndexes.push(oneBased);
+            collectReason(`Image ${oneBased}: location outside allowed radius`);
+        }
+    });
+
+    const autoVerified =
+        incompleteIndexes.length === 0
+        && missingExifIndexes.length === 0
+        && dateMismatchIndexes.length === 0
+        && radiusMismatchIndexes.length === 0;
+
+    const preferredEvidence =
+        normalizedEvidence.find((item) =>
+            Number.isFinite(item?.exifLatitude)
+            && Number.isFinite(item?.exifLongitude)
+            && item?.exifCapturedAt instanceof Date,
+        )
+        || normalizedEvidence.find((item) =>
+            Number.isFinite(item?.latitude) && Number.isFinite(item?.longitude),
+        )
+        || null;
+
+    const status = normalizeCheckOutVerificationStatus(
+        autoVerified ? 'auto_verified' : 'manual_review_required',
+        'MANUAL_REVIEW_REQUIRED',
+    );
+
+    return {
+        status,
+        reason: autoVerified ? null : (collectedReasons.join(' ') || 'Manual review required'),
+        capturedAt: preferredEvidence?.exifCapturedAt || preferredEvidence?.capturedAt || null,
+        latitude: Number.isFinite(preferredEvidence?.exifLatitude)
+            ? preferredEvidence.exifLatitude
+            : (Number.isFinite(preferredEvidence?.latitude) ? preferredEvidence.latitude : null),
+        longitude: Number.isFinite(preferredEvidence?.exifLongitude)
+            ? preferredEvidence.exifLongitude
+            : (Number.isFinite(preferredEvidence?.longitude) ? preferredEvidence.longitude : null),
+        distanceMeters: Number.isFinite(preferredEvidence?.distanceMeters)
+            ? preferredEvidence.distanceMeters
+            : null,
+    };
+};
+
+const applyCheckOutVerificationResult = ({
+    attendance,
+    verificationResult,
+}) => {
+    if (!attendance || !verificationResult) return false;
+
+    const normalizedStatus = normalizeCheckOutVerificationStatus(
+        verificationResult.status,
+        'PENDING_CHECKOUT',
+    );
+    const autoVerified = normalizedStatus === 'AUTO_VERIFIED';
+    const verificationTimestamp = autoVerified ? new Date() : null;
+
+    attendance.checkOutVerificationStatus = normalizedStatus;
+    attendance.checkOutVerificationMode = 'AUTO';
+    attendance.checkOutVerificationReason = autoVerified
+        ? null
+        : (verificationResult.reason || 'Manual review required');
+    attendance.geoValidationComment = autoVerified
+        ? null
+        : (verificationResult.reason || 'Manual review required');
+    attendance.checkOutCapturedAt = verificationResult.capturedAt || null;
+    attendance.checkOutLatitude = Number.isFinite(verificationResult.latitude)
+        ? verificationResult.latitude
+        : null;
+    attendance.checkOutLongitude = Number.isFinite(verificationResult.longitude)
+        ? verificationResult.longitude
+        : null;
+    attendance.checkOutGeoDistanceMeters = Number.isFinite(verificationResult.distanceMeters)
+        ? verificationResult.distanceMeters
+        : null;
+    attendance.checkOutVerifiedAt = verificationTimestamp;
+    attendance.checkOutVerifiedBy = null;
+    attendance.geoVerificationStatus = normalizeVerificationStatus(
+        autoVerified ? 'approved' : 'pending',
+        'pending',
+    );
+    attendance.finalStatus = normalizeAttendanceFinalStatus(
+        autoVerified ? 'completed' : 'pending',
+        'PENDING',
+    );
+    attendance.completedAt = verificationTimestamp;
+
+    return autoVerified;
+};
 
 const ensureFixedLengthSlotArray = (items, slotCount, buildDefaultSlot) => (
     Array.from({ length: slotCount }, (_, index) => {
@@ -241,170 +782,368 @@ const deriveUploadedImageFinalStatus = (images = []) => {
     return allVerified ? 'COMPLETED' : 'PENDING';
 };
 
-const hasAttendanceDocs = (attendance) =>
-    Boolean(attendance?.attendancePdfUrl || attendance?.attendanceExcelUrl);
+const saveUploadedGeoImageSlot = async ({
+    attendanceId,
+    assignedDate,
+    imageIndex,
+    normalizedImageData,
+    uploadedPhotoPayload
+}) => {
+    let lastVersionError = null;
 
-const hasGeoTagDocs = (attendance) =>
-    Boolean(
-        attendance?.signatureUrl
-        || attendance?.studentsPhotoUrl
-        || attendance?.checkOutGeoImageUrl
-        || (Array.isArray(attendance?.checkOutGeoImageUrls) && attendance.checkOutGeoImageUrls.length)
-        || (Array.isArray(attendance?.activityPhotos) && attendance.activityPhotos.length)
-        || (Array.isArray(attendance?.activityVideos) && attendance.activityVideos.length)
-    );
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        const latestAttendance = await Attendance.findById(attendanceId);
 
-const normalizeVerificationStatus = (value, fallback = 'pending') => {
-    const normalized = String(value || '').trim().toLowerCase();
-    if (normalized === 'approved') return 'approved';
-    if (normalized === 'rejected') return 'rejected';
-    return fallback;
-};
+        if (!latestAttendance) {
+            const notFoundError = new Error('Attendance record not found for this trainer and date');
+            notFoundError.statusCode = 404;
+            throw notFoundError;
+        }
 
-const buildDocsStatusLabel = (attendance) => hasAttendanceDocs(attendance) ? 'Docs Uploaded' : 'Pending';
+        if (normalizeVerificationStatus(latestAttendance?.verificationStatus, '') !== 'approved') {
+            const approvalError = new Error('Check-in must be approved by SPOC before GeoTag upload is allowed.');
+            approvalError.statusCode = 400;
+            throw approvalError;
+        }
 
-const buildGeoStatusLabel = (attendance) => {
-    const normalized = normalizeVerificationStatus(attendance?.geoVerificationStatus);
-    if (normalized === 'approved') return 'Completed';
-    return 'Pending';
-};
+        const latestCheckOut = latestAttendance.checkOut && typeof latestAttendance.checkOut.toObject === 'function'
+            ? latestAttendance.checkOut.toObject()
+            : (latestAttendance.checkOut || {});
+        const imageSlots = ensureFixedLengthSlotArray(
+            Array.isArray(latestAttendance.images) && latestAttendance.images.length
+                ? latestAttendance.images
+                : latestCheckOut.images,
+            3,
+            buildPendingCheckOutImageSlot
+        );
+        const photoSlots = ensureFixedLengthSlotArray(
+            latestCheckOut.photos,
+            3,
+            buildPendingCheckOutPhotoSlot
+        );
 
-const normalizeDayStatus = (value) => {
-    const normalized = String(value || '').trim().toLowerCase();
-    if (normalized === 'completed') return 'completed';
-    if (normalized === 'pending') return 'pending';
-    if (normalized === 'not_assigned') return 'not_assigned';
-    return null;
-};
+        const existingImageSlot = imageSlots[imageIndex];
+        if (
+            String(existingImageSlot?.status || '').trim().toUpperCase() === 'VERIFIED'
+            && String(existingImageSlot?.image || '').trim()
+        ) {
+            const lockedError = new Error(`Image ${imageIndex + 1} is already verified and cannot be replaced`);
+            lockedError.statusCode = 409;
+            throw lockedError;
+        }
 
-const buildPersistedDayStatus = (schedule, attendance) => {
-    const attendanceUploaded = hasAttendanceDocs(attendance);
-    const geoTagUploaded = hasGeoTagDocs(attendance);
-    const hasTrainerAssigned = Boolean(schedule?.trainerId);
-    const attendanceVerification = normalizeVerificationStatus(attendance?.verificationStatus, '');
-    const geoVerification = normalizeVerificationStatus(attendance?.geoVerificationStatus, '');
+        imageSlots[imageIndex] = normalizedImageData;
+        photoSlots[imageIndex] = uploadedPhotoPayload;
 
-    if (!hasTrainerAssigned || String(schedule?.status || '').trim().toLowerCase() === 'cancelled') {
-        return {
-            attendanceUploaded,
-            geoTagUploaded,
-            dayStatus: 'not_assigned'
+        const uploadedPhotoUrls = photoSlots
+            .map((item) => item?.url)
+            .filter((value) => typeof value === 'string' && value.trim());
+        const firstImageWithLocation = photoSlots.find(
+            (item) => Number.isFinite(item?.latitude) && Number.isFinite(item?.longitude)
+        );
+        const pendingReasons = photoSlots
+            .map((item, index) => {
+                if (!String(item?.url || '').trim()) {
+                    return `Image ${index + 1}: Upload required`;
+                }
+
+                return String(item?.validationStatus || '').trim().toLowerCase() === 'verified'
+                    ? null
+                    : `Image ${index + 1}: ${item?.validationReason || 'Pending verification'}`;
+            })
+            .filter(Boolean);
+        const evidenceItems = photoSlots.map((item, index) => {
+            const imageSlot = imageSlots[index] || {};
+            const imageStatus = String(imageSlot?.status || '').trim().toUpperCase();
+            const photoStatus = String(item?.validationStatus || '').trim().toLowerCase();
+            const status = imageStatus === 'VERIFIED' || photoStatus === 'verified'
+                ? 'COMPLETED'
+                : 'PENDING';
+            return toCheckOutEvidenceItem({
+                status,
+                reason: item?.validationReason || null,
+                report: item?.verificationReport || null,
+                distanceKm: Number.isFinite(item?.distanceKm)
+                    ? item.distanceKm
+                    : (Number.isFinite(imageSlot?.distance) ? imageSlot.distance : null),
+                latitude: Number.isFinite(item?.latitude)
+                    ? item.latitude
+                    : (Number.isFinite(imageSlot?.latitude) ? imageSlot.latitude : null),
+                longitude: Number.isFinite(item?.longitude)
+                    ? item.longitude
+                    : (Number.isFinite(imageSlot?.longitude) ? imageSlot.longitude : null),
+                capturedAt: item?.capturedAt || null,
+            });
+        });
+        const checkOutVerificationResult = buildCheckOutVerificationResult({
+            evidenceItems,
+            fallbackReasons: pendingReasons,
+        });
+        applyCheckOutVerificationResult({
+            attendance: latestAttendance,
+            verificationResult: checkOutVerificationResult,
+        });
+
+        latestAttendance.assignedDate = assignedDate;
+        latestAttendance.images = imageSlots;
+        latestAttendance.checkOutGeoImageUrl = uploadedPhotoUrls[0] || null;
+        latestAttendance.checkOutGeoImageUrls = uploadedPhotoUrls;
+        latestAttendance.driveSyncStatus = 'PENDING';
+        latestAttendance.checkOut = {
+            ...latestCheckOut,
+            finalStatus: normalizeAttendanceFinalStatus(latestAttendance.finalStatus, 'PENDING'),
+            location: {
+                ...(latestCheckOut?.location || {}),
+                lat: Number.isFinite(firstImageWithLocation?.latitude)
+                    ? firstImageWithLocation.latitude
+                    : (latestCheckOut?.location?.lat ?? null),
+                lng: Number.isFinite(firstImageWithLocation?.longitude)
+                    ? firstImageWithLocation.longitude
+                    : (latestCheckOut?.location?.lng ?? null),
+                accuracy: Number.isFinite(firstImageWithLocation?.latitude) && Number.isFinite(firstImageWithLocation?.longitude)
+                    ? null
+                    : (latestCheckOut?.location?.accuracy ?? null),
+                address: Number.isFinite(firstImageWithLocation?.latitude) && Number.isFinite(firstImageWithLocation?.longitude)
+                    ? 'Geo-tag image location'
+                    : (latestCheckOut?.location?.address || null),
+                distanceFromCollege: Number.isFinite(firstImageWithLocation?.distanceKm)
+                    ? firstImageWithLocation.distanceKm * 1000
+                    : (latestCheckOut?.location?.distanceFromCollege ?? null),
+            },
+            images: imageSlots,
+            photos: photoSlots
         };
+        latestAttendance.markModified('images');
+        latestAttendance.markModified('checkOut');
+        latestAttendance.markModified('checkOutGeoImageUrl');
+        latestAttendance.markModified('checkOutGeoImageUrls');
+        latestAttendance.markModified('checkOutVerificationStatus');
+        latestAttendance.markModified('checkOutVerificationMode');
+        latestAttendance.markModified('checkOutVerificationReason');
+        latestAttendance.markModified('checkOutCapturedAt');
+        latestAttendance.markModified('checkOutLatitude');
+        latestAttendance.markModified('checkOutLongitude');
+        latestAttendance.markModified('checkOutGeoDistanceMeters');
+        latestAttendance.markModified('checkOutVerifiedAt');
+        latestAttendance.markModified('checkOutVerifiedBy');
+        latestAttendance.markModified('driveSyncStatus');
+
+        try {
+            await latestAttendance.save();
+            return latestAttendance;
+        } catch (error) {
+            if (error?.name === 'VersionError') {
+                lastVersionError = error;
+                continue;
+            }
+            throw error;
+        }
     }
 
-    if (
-        attendanceUploaded
-        && geoTagUploaded
-        && attendanceVerification === 'approved'
-        && geoVerification === 'approved'
-    ) {
-        return {
-            attendanceUploaded,
-            geoTagUploaded,
-            dayStatus: 'completed'
-        };
-    }
-
-    return {
-        attendanceUploaded,
-        geoTagUploaded,
-        dayStatus: 'pending'
-    };
+    throw lastVersionError || new Error('Failed to save GeoTag image after retrying concurrent updates.');
 };
 
-const syncScheduleDayState = async ({
-    scheduleId,
-    schedule = null,
-    attendance = null,
-    dayStatusOverride = undefined
-} = {}) => {
-    if (!scheduleId) return null;
 
-    const scheduleDoc = schedule && typeof schedule === 'object' && schedule._id
-        ? schedule
-        : await Schedule.findById(scheduleId).select('trainerId status attendanceUploaded geoTagUploaded dayStatus');
 
-    if (!scheduleDoc) return null;
-
-    const attendanceDoc = attendance
-        || await Attendance.findOne({ scheduleId }).sort({ createdAt: -1 });
-
-    const derivedState = buildPersistedDayStatus(scheduleDoc, attendanceDoc);
-    const normalizedOverride = normalizeDayStatus(dayStatusOverride);
-    const nextState = {
-        attendanceUploaded: derivedState.attendanceUploaded,
-        geoTagUploaded: derivedState.geoTagUploaded,
-        dayStatus: normalizedOverride || derivedState.dayStatus,
-        dayStatusUpdatedAt: new Date()
-    };
-
-    const shouldUpdate =
-        scheduleDoc.attendanceUploaded !== nextState.attendanceUploaded
-        || scheduleDoc.geoTagUploaded !== nextState.geoTagUploaded
-        || normalizeDayStatus(scheduleDoc.dayStatus) !== nextState.dayStatus;
-
-    if (shouldUpdate) {
-        await Schedule.findByIdAndUpdate(scheduleId, { $set: nextState });
-    }
-
-    return nextState;
-};
-
-const deriveScheduleLifecycleStatusFromAttendance = (attendance) => {
-    const attendanceVerification = normalizeVerificationStatus(attendance?.verificationStatus, '');
-    const geoVerification = normalizeVerificationStatus(attendance?.geoVerificationStatus, '');
-
-    if (attendanceVerification === 'rejected') {
-        return 'scheduled';
-    }
-
-    if (attendanceVerification === 'approved' && geoVerification === 'approved') {
-        return 'COMPLETED';
-    }
-
-    if (attendanceVerification === 'approved') {
-        return 'inprogress';
-    }
-
-    return 'inprogress';
-};
-
-const syncScheduleLifecycleStatusFromAttendance = async ({ scheduleId, attendance }) => {
-    if (!scheduleId || !attendance) return null;
-    const nextStatus = deriveScheduleLifecycleStatusFromAttendance(attendance);
-    await Schedule.findByIdAndUpdate(scheduleId, { status: nextStatus });
-    return nextStatus;
-};
-
-const emitAttendanceRealtimeUpdate = (req, payload = {}) => {
-    const io = req?.app?.get?.('io');
-    if (!io) return;
-    io.emit('attendanceUpdate', payload);
-};
-
-const validateAssignedScheduleUpload = ({ schedule, trainerId, collegeId, dayNumber }) => {
+const validateAssignedScheduleUpload = ({ schedule, trainerId, collegeId, dayNumber, correlationId = null }) => {
     if (!schedule) {
         return { status: 404, message: 'Schedule not found' };
     }
 
-    const scheduleTrainerId = toIdString(schedule.trainerId);
-    if (!scheduleTrainerId) {
+    if (schedule.isActive === false) {
+        logAttendanceAsyncTelemetry('warn', {
+            correlationId,
+            stage: 'checkin_validation_rejection',
+            trainerId: toIdString(trainerId),
+            scheduleId: toIdString(schedule._id),
+            collegeId: toIdString(collegeId),
+            status: 'rejection',
+            outcome: 'denied',
+            contextLabel: 'validateAssignedScheduleUpload',
+            reason: `BRANCH=attendanceRoutes_validateAssignedScheduleUpload_inactive;rejectionEnum=INACTIVE_SCHEDULE`
+        });
+        return { status: 403, message: 'This schedule is inactive and cannot be modified' };
+    }
+
+    const rawStatus = String(schedule.status || '').toLowerCase();
+    if (rawStatus === 'cancelled') {
+        logAttendanceAsyncTelemetry('warn', {
+            correlationId,
+            stage: 'checkin_validation_rejection',
+            trainerId: toIdString(trainerId),
+            scheduleId: toIdString(schedule._id),
+            collegeId: toIdString(collegeId),
+            status: 'rejection',
+            outcome: 'denied',
+            contextLabel: 'validateAssignedScheduleUpload',
+            reason: `BRANCH=attendanceRoutes_validateAssignedScheduleUpload_cancelled;rejectionEnum=CANCELLED_SCHEDULE`
+        });
+        return { status: 403, message: 'This training session is cancelled and no longer actionable' };
+    }
+
+    if (rawStatus === 'completed') {
+        logAttendanceAsyncTelemetry('warn', {
+            correlationId,
+            stage: 'checkin_validation_rejection',
+            trainerId: toIdString(trainerId),
+            scheduleId: toIdString(schedule._id),
+            collegeId: toIdString(collegeId),
+            status: 'rejection',
+            outcome: 'denied',
+            contextLabel: 'validateAssignedScheduleUpload',
+            reason: `BRANCH=attendanceRoutes_validateAssignedScheduleUpload_completed;rejectionEnum=COMPLETED_SCHEDULE`
+        });
+        return { status: 403, message: 'This training day is already marked as COMPLETED. No further edits allowed.' };
+    }
+
+    const expectedTrainerId = toIdString(schedule.trainerId);
+    const providedTrainerId = toIdString(trainerId);
+    const expectedCollegeId = toIdString(schedule.collegeId);
+    const providedCollegeId = toIdString(collegeId);
+    const expectedDayNumber = toDayNumber(schedule.dayNumber);
+    const providedDayNumber = toDayNumber(dayNumber);
+
+    if (!expectedTrainerId) {
         return { status: 403, message: 'This day is not assigned to any trainer yet' };
     }
 
-    if (trainerId && scheduleTrainerId !== toIdString(trainerId)) {
+    // Role-based/Assigned Trainer Validation
+    if (providedTrainerId && expectedTrainerId !== providedTrainerId) {
+        logAttendanceAsyncTelemetry('warn', {
+            correlationId,
+            stage: 'validate_upload_access',
+            status: 'auth_failure',
+            trainerId: providedTrainerId,
+            scheduleId: toIdString(schedule._id),
+            outcome: 'forbidden',
+            reason: `Trainer Mismatch: provided=${providedTrainerId}, expected=${expectedTrainerId}`,
+            contextLabel: 'UPLOAD_ACCESS_ERROR'
+        });
+        // HIGH-SIGNAL DIAGNOSTICS: Capture precisely why this is failing.
+        logAttendanceAsyncTelemetry('warn', {
+            correlationId,
+            stage: 'checkin_validation_rejection',
+            trainerId: providedTrainerId,
+            scheduleId: toIdString(schedule?._id),
+            collegeId: providedCollegeId,
+            status: 'rejection',
+            outcome: 'denied',
+            contextLabel: 'validateAssignedScheduleUpload',
+            reason: `BRANCH=attendanceRoutes_validateAssignedScheduleUpload;` +
+                   `providedTrainer=${providedTrainerId};type=${typeof trainerId};` +
+                   `expectedTrainer=${toIdString(schedule.trainerId)};type=${typeof schedule.trainerId};` +
+                   `providedCollege=${providedCollegeId};type=${typeof collegeId};` +
+                   `expectedCollege=${toIdString(schedule.collegeId)};type=${typeof schedule.collegeId};` +
+                   `providedDay=${providedDayNumber};type=${typeof dayNumber};` +
+                   `expectedDay=${toDayNumber(schedule.dayNumber)};type=${typeof schedule.dayNumber};` +
+                   `rejectionEnum=${
+                    toIdString(schedule.trainerId) !== providedTrainerId ? 'TRAINER_MISMATCH' :
+                    toIdString(schedule.collegeId) !== providedCollegeId ? 'COLLEGE_MISMATCH' :
+                    toDayNumber(schedule.dayNumber) !== providedDayNumber ? 'DAY_MISMATCH' :
+                    'UNKNOWN_BRANCH'
+                   }`
+        });
+
         return { status: 403, message: 'Trainer can only upload for the assigned day and batch' };
     }
 
-    const scheduleCollegeId = toIdString(schedule.collegeId);
-    if (collegeId && scheduleCollegeId && scheduleCollegeId !== toIdString(collegeId)) {
+    // College/Batch Validation
+    if (providedCollegeId && expectedCollegeId && expectedCollegeId !== providedCollegeId) {
+        // HIGH-SIGNAL DIAGNOSTICS: Capture precisely why this is failing.
+        logAttendanceAsyncTelemetry('warn', {
+            correlationId,
+            stage: 'checkin_validation_rejection',
+            trainerId: providedTrainerId,
+            scheduleId: toIdString(schedule?._id),
+            collegeId: providedCollegeId,
+            status: 'rejection',
+            outcome: 'denied',
+            contextLabel: 'validateAssignedScheduleUpload',
+            reason: `BRANCH=attendanceRoutes_validateAssignedScheduleUpload_college;` +
+                   `providedTrainer=${providedTrainerId};` +
+                   `expectedTrainer=${expectedTrainerId};` +
+                   `providedCollege=${providedCollegeId};type=${typeof collegeId};` +
+                   `expectedCollege=${expectedCollegeId};type=${typeof schedule.collegeId};` +
+                   `rejectionEnum=COLLEGE_MISMATCH`
+        });
         return { status: 403, message: 'Trainer can only upload for the assigned batch and college' };
     }
 
-    const requestedDayNumber = toDayNumber(dayNumber);
-    const scheduledDayNumber = toDayNumber(schedule.dayNumber);
-    if (requestedDayNumber && scheduledDayNumber && requestedDayNumber !== scheduledDayNumber) {
+    // Day Number Validation
+    if (providedDayNumber && expectedDayNumber && expectedDayNumber !== providedDayNumber) {
+        // HIGH-SIGNAL DIAGNOSTICS: Capture precisely why this is failing.
+        logAttendanceAsyncTelemetry('warn', {
+            correlationId,
+            stage: 'checkin_validation_rejection',
+            trainerId: providedTrainerId,
+            scheduleId: toIdString(schedule?._id),
+            collegeId: providedCollegeId,
+            status: 'rejection',
+            outcome: 'denied',
+            contextLabel: 'validateAssignedScheduleUpload',
+            reason: `BRANCH=attendanceRoutes_validateAssignedScheduleUpload_day;` +
+                   `providedTrainer=${providedTrainerId};` +
+                   `providedDay=${providedDayNumber};type=${typeof dayNumber};` +
+                   `expectedDay=${expectedDayNumber};type=${typeof schedule.dayNumber};` +
+                   `rejectionEnum=DAY_MISMATCH`
+        });
+        
+        logAttendanceAsyncTelemetry('warn', {
+            correlationId,
+            stage: 'validate_upload_access',
+            status: 'day_failure',
+            trainerId: providedTrainerId,
+            dayNumber: providedDayNumber,
+            scheduleId: toIdString(schedule._id),
+            outcome: 'forbidden',
+            reason: `Day Mismatch: provided=${providedDayNumber}, expected=${expectedDayNumber}`,
+            contextLabel: 'UPLOAD_ACCESS_ERROR'
+        });
         return { status: 403, message: 'Trainer can only upload for the assigned day' };
+    }
+
+    return null;
+};
+
+const validateCheckOutSessionState = ({ attendance, mode = 'check-out' } = {}) => {
+    if (!attendance) {
+        return { status: 404, message: 'Attendance record not found for this schedule' };
+    }
+
+    const attendanceStatusToken = String(attendance?.status || '').trim().toLowerCase();
+    if (attendanceStatusToken === 'cancelled' || attendanceStatusToken === 'canceled') {
+        return {
+            status: 400,
+            message: mode === 'geo-upload'
+                ? 'Attendance session is cancelled and cannot accept GeoTag uploads.'
+                : 'Attendance session is cancelled and cannot be checked out.'
+        };
+    }
+
+    const normalizedCheckOutStatus = normalizeCheckOutVerificationStatus(
+        attendance?.checkOutVerificationStatus,
+        '',
+    );
+    if (normalizedCheckOutStatus === 'AUTO_VERIFIED') {
+        return {
+            status: 400,
+            message: mode === 'geo-upload'
+                ? 'Check-out is already completed for this schedule. GeoTag upload is locked.'
+                : 'Check-out is already completed for this schedule.'
+        };
+    }
+
+    const normalizedFinalStatus = normalizeAttendanceFinalStatus(
+        attendance?.finalStatus,
+        '',
+    );
+    if (normalizedFinalStatus === 'COMPLETED') {
+        return {
+            status: 400,
+            message: mode === 'geo-upload'
+                ? 'Check-out is already completed for this schedule. GeoTag upload is locked.'
+                : 'Check-out is already completed for this schedule.'
+        };
     }
 
     return null;
@@ -673,7 +1412,16 @@ const ensureScheduleDriveFolders = async ({ scheduleId, scheduleDoc }) => {
     return { ...scheduleFolderState, departmentId: fullSchedule.departmentId, dayNumber };
 };
 
-const uploadAttendanceFilesToDrive = async ({ filesByField, getTargetFolder, buildFileName }) => {
+const uploadAttendanceFilesToDrive = async ({
+    filesByField,
+    getTargetFolder,
+    buildFileName,
+    correlationId = null,
+    attempt = null,
+    scheduleId = null,
+    attendanceId = null,
+    contextLabel = null,
+}) => {
     const uploadedByField = {};
     const uploadedFiles = [];
 
@@ -687,9 +1435,18 @@ const uploadAttendanceFilesToDrive = async ({ filesByField, getTargetFolder, bui
 
         const fieldUploads = [];
         for (const [index, file] of normalizedFiles.entries()) {
-            console.log(
-                `[ATTENDANCE][DRIVE] Uploading field=${fieldName} file="${file.originalname || path.basename(file.path)}" to folder=${targetFolder.id} (${targetFolder.name || targetFolder.type || 'unknown'})`
-            );
+            logAttendanceAsyncTelemetry('debug', {
+                correlationId,
+                stage: 'drive_file_upload_started',
+                scheduleId: scheduleId ? String(scheduleId) : null,
+                attendanceId: attendanceId ? String(attendanceId) : null,
+                status: 'drive_sync',
+                outcome: 'started',
+                attempt: Number.isFinite(attempt) ? attempt : null,
+                cleanupMode: 'drive_upload',
+                reason: `field=${fieldName};file=${file.originalname || path.basename(file.path)};folder=${targetFolder.id}`,
+                contextLabel,
+            });
             const fileBuffer = await fs.promises.readFile(file.path);
             const uploaded = await uploadToDriveWithRetry({
                 fileBuffer,
@@ -885,19 +1642,237 @@ const collectAttendanceFilesForDriveSync = (attendance) => {
     return filesByField;
 };
 
-const syncStoredAttendanceFilesToDrive = async (attendance, contextLabel) => {
+const syncStoredAttendanceFilesToDrive = async (
+    attendance,
+    contextLabel,
+    options = {}
+) => {
     if (!attendance?.scheduleId) return;
+    const correlationId = options?.correlationId || createCorrelationId('attendance_drive_sync');
+    const attempt = Number.parseInt(options?.attempt || '1', 10) || 1;
 
     const filesByField = collectAttendanceFilesForDriveSync(attendance);
-    if (!Object.keys(filesByField).length) return;
+    if (!Object.keys(filesByField).length) {
+        attendance.driveSyncStatus = 'PENDING';
+        await attendance.save();
+        logAttendanceAsyncTelemetry('info', {
+            correlationId,
+            stage: 'drive_sync_skipped_no_files',
+            scheduleId: attendance?.scheduleId ? String(attendance.scheduleId) : null,
+            attendanceId: attendance?._id ? String(attendance._id) : null,
+            status: 'drive_sync',
+            outcome: 'skipped',
+            attempt,
+            contextLabel,
+        });
+        return;
+    }
 
-    await syncAttendanceFilesToDrive({
-        attendance,
-        scheduleId: attendance.scheduleId,
-        filesByField,
-        contextLabel
-    });
+    try {
+        await syncAttendanceFilesToDrive({
+            attendance,
+            scheduleId: attendance.scheduleId,
+            filesByField,
+            contextLabel,
+            correlationId,
+            attempt,
+        });
+        attendance.driveSyncStatus = attendance?.driveAssets?.lastSyncError
+            ? 'FAILED'
+            : 'SYNCED';
+        logAttendanceAsyncTelemetry('info', {
+            correlationId,
+            stage: 'drive_sync_completed',
+            scheduleId: attendance?.scheduleId ? String(attendance.scheduleId) : null,
+            attendanceId: attendance?._id ? String(attendance._id) : null,
+            status: 'drive_sync',
+            outcome: attendance?.driveAssets?.lastSyncError ? 'failed' : 'succeeded',
+            attempt,
+            contextLabel,
+            reason: attendance?.driveAssets?.lastSyncError || null,
+        });
+    } catch (error) {
+        attendance.driveSyncStatus = 'FAILED';
+        logAttendanceAsyncTelemetry('error', {
+            correlationId,
+            stage: 'drive_sync_failed',
+            scheduleId: attendance?.scheduleId ? String(attendance.scheduleId) : null,
+            attendanceId: attendance?._id ? String(attendance._id) : null,
+            status: 'drive_sync',
+            outcome: 'failed',
+            attempt,
+            contextLabel,
+            reason: error.message,
+        });
+    }
+
     await attendance.save();
+};
+
+let attendanceDriveSyncJobRegistered = false;
+const ensureAttendanceDriveSyncJobRegistration = () => {
+    if (attendanceDriveSyncJobRegistered) return;
+
+    registerFileWorkflowJobHandler(
+        FILE_WORKFLOW_JOB_TYPES.ATTENDANCE_DRIVE_SYNC,
+        async (payload = {}, job = {}) => {
+            const attendanceId = payload.attendanceId;
+            const contextLabel = payload.contextLabel || 'attendance-drive-sync';
+            const correlationId = payload.correlationId || createCorrelationId('attendance_drive_sync');
+            const attempt = Number.parseInt(job?.attempt || '0', 10) + 1;
+
+            if (!attendanceId) return;
+            const latestAttendance = await Attendance.findById(attendanceId);
+            if (!latestAttendance) return;
+
+            await syncStoredAttendanceFilesToDrive(latestAttendance, contextLabel, {
+                correlationId,
+                attempt,
+            });
+        }
+    );
+
+    attendanceDriveSyncJobRegistered = true;
+};
+
+const queueStoredAttendanceDriveSync = ({
+    attendanceId,
+    contextLabel,
+    correlationId = null,
+}) => {
+    if (!attendanceId || !isTrainingDriveEnabled()) return false;
+    const resolvedCorrelationId = correlationId || createCorrelationId('attendance_drive_sync');
+
+    ensureAttendanceDriveSyncJobRegistration();
+    Attendance.updateOne(
+        { _id: attendanceId },
+        { $set: { driveSyncStatus: 'QUEUED' } },
+    ).catch((error) => {
+        logAttendanceAsyncTelemetry('warn', {
+            correlationId: resolvedCorrelationId,
+            stage: 'drive_sync_mark_queued_failed',
+            attendanceId: String(attendanceId),
+            status: 'drive_sync',
+            outcome: 'failed',
+            cleanupMode: 'queue_mark',
+            reason: error.message,
+            contextLabel,
+        });
+    });
+    enqueueFileWorkflowJob({
+        type: FILE_WORKFLOW_JOB_TYPES.ATTENDANCE_DRIVE_SYNC,
+        payload: {
+            attendanceId: String(attendanceId),
+            contextLabel: contextLabel || 'attendance-drive-sync',
+            correlationId: resolvedCorrelationId,
+        },
+        maxAttempts: 3,
+    }).catch((error) => {
+        Attendance.updateOne(
+            { _id: attendanceId },
+            { $set: { driveSyncStatus: 'FAILED' } },
+        ).catch((statusUpdateError) => {
+            logAttendanceAsyncTelemetry('error', {
+                correlationId: resolvedCorrelationId,
+                stage: 'drive_sync_mark_failed_after_enqueue_error',
+                attendanceId: String(attendanceId),
+                status: 'drive_sync',
+                outcome: 'failed',
+                cleanupMode: 'queue_mark',
+                reason: statusUpdateError.message,
+                contextLabel,
+            });
+        });
+        logAttendanceAsyncTelemetry('error', {
+            correlationId: resolvedCorrelationId,
+            stage: 'drive_sync_enqueue_failed',
+            attendanceId: String(attendanceId),
+            status: 'drive_sync',
+            outcome: 'failed',
+            cleanupMode: 'queue_enqueue',
+            reason: error.message,
+            contextLabel,
+        });
+    });
+
+    logAttendanceAsyncTelemetry('info', {
+        correlationId: resolvedCorrelationId,
+        stage: 'drive_sync_enqueued',
+        attendanceId: String(attendanceId),
+        status: 'drive_sync',
+        outcome: 'queued',
+        attempt: 1,
+        cleanupMode: 'queue_enqueue',
+        contextLabel,
+    });
+
+    return true;
+};
+
+const resolveCanonicalUploadFolders = async ({
+    scheduleDoc,
+    dayEntry,
+    dayFolderId,
+    ensureDriveFolderLoader = ensureDriveFolder,
+}) => {
+    if (!dayFolderId) return null;
+
+    const preferredDayEntry = {
+        ...(dayEntry || {}),
+    };
+    if (scheduleDoc?.attendanceFolderId) {
+        delete preferredDayEntry.attendanceFolderId;
+        delete preferredDayEntry.attendanceFolderName;
+        delete preferredDayEntry.attendanceFolderLink;
+        delete preferredDayEntry.attendanceFolder;
+    }
+    if (scheduleDoc?.geoTagFolderId) {
+        delete preferredDayEntry.geoTagFolderId;
+        delete preferredDayEntry.geoTagFolderName;
+        delete preferredDayEntry.geoTagFolderLink;
+        delete preferredDayEntry.geoTagFolder;
+    }
+
+    const resolvedFolderFields = buildScheduleFolderFields({
+        dayEntry: preferredDayEntry,
+        fallbackDayFolderId: scheduleDoc?.dayFolderId || scheduleDoc?.driveFolderId || null,
+        fallbackDayFolderName: scheduleDoc?.dayFolderName || scheduleDoc?.driveFolderName || null,
+        fallbackDayFolderLink: scheduleDoc?.dayFolderLink || scheduleDoc?.driveFolderLink || null,
+        fallbackAttendanceFolderId: scheduleDoc?.attendanceFolderId || null,
+        fallbackAttendanceFolderName: scheduleDoc?.attendanceFolderName || null,
+        fallbackAttendanceFolderLink: scheduleDoc?.attendanceFolderLink || null,
+        fallbackGeoTagFolderId: scheduleDoc?.geoTagFolderId || null,
+        fallbackGeoTagFolderName: scheduleDoc?.geoTagFolderName || null,
+        fallbackGeoTagFolderLink: scheduleDoc?.geoTagFolderLink || null,
+    });
+
+    const attendanceFolder = resolvedFolderFields.attendanceFolderId
+        ? {
+            id: resolvedFolderFields.attendanceFolderId,
+            name: resolvedFolderFields.attendanceFolderName || DRIVE_DAY_SUBFOLDERS.attendance,
+            webViewLink: resolvedFolderFields.attendanceFolderLink || null
+        }
+        : await ensureDriveFolderLoader({
+            folderName: DRIVE_DAY_SUBFOLDERS.attendance,
+            parentFolderId: dayFolderId
+        });
+
+    const geoTagFolder = resolvedFolderFields.geoTagFolderId
+        ? {
+            id: resolvedFolderFields.geoTagFolderId,
+            name: resolvedFolderFields.geoTagFolderName || DRIVE_DAY_SUBFOLDERS.geoTag,
+            webViewLink: resolvedFolderFields.geoTagFolderLink || null
+        }
+        : await ensureDriveFolderLoader({
+            folderName: DRIVE_DAY_SUBFOLDERS.geoTag,
+            parentFolderId: dayFolderId
+        });
+
+    return {
+        attendanceFolder,
+        geoTagFolder,
+        resolvedFolderFields
+    };
 };
 
 const syncAttendanceFilesToDrive = async ({
@@ -905,10 +1880,14 @@ const syncAttendanceFilesToDrive = async ({
     scheduleId,
     schedule,
     filesByField,
-    contextLabel = 'attendance upload'
+    contextLabel = 'attendance upload',
+    correlationId = null,
+    attempt = null,
 }) => {
     if (!attendance || !filesByField || !Object.keys(filesByField).length) return;
     if (!isTrainingDriveEnabled()) return;
+    const resolvedCorrelationId = correlationId || createCorrelationId('attendance_drive_sync');
+    const resolvedAttempt = Number.parseInt(attempt || '1', 10) || 1;
 
     const scheduleDoc = schedule?.driveFolderId || schedule?.dayFolderId
         ? schedule
@@ -946,7 +1925,17 @@ const syncAttendanceFilesToDrive = async ({
                 scheduleDoc.driveFolderLink = ensured.dayFolderLink;
             }
         } catch (ensureError) {
-            console.error('[ATTENDANCE][DRIVE] Failed to ensure schedule drive folders:', ensureError.message);
+            logAttendanceAsyncTelemetry('warn', {
+                correlationId: resolvedCorrelationId,
+                stage: 'ensure_schedule_drive_folders_failed',
+                scheduleId: scheduleId ? String(scheduleId) : null,
+                attendanceId: attendance?._id ? String(attendance._id) : null,
+                status: 'drive_sync',
+                outcome: 'failed',
+                attempt: resolvedAttempt,
+                reason: ensureError.message,
+                contextLabel,
+            });
         }
     }
     if (!dayFolderId) return;
@@ -954,38 +1943,14 @@ const syncAttendanceFilesToDrive = async ({
     attendance.driveFolderId = dayFolderId;
 
     try {
-        const attendanceFolder = scheduleDoc?.attendanceFolderId
-            ? {
-                id: scheduleDoc.attendanceFolderId,
-                name: scheduleDoc.attendanceFolderName || DRIVE_DAY_SUBFOLDERS.attendance,
-                webViewLink: scheduleDoc.attendanceFolderLink || null
-            }
-            : dayEntry?.attendanceFolderId
-            ? {
-                id: dayEntry.attendanceFolderId,
-                name: dayEntry.attendanceFolderName || DRIVE_DAY_SUBFOLDERS.attendance,
-                webViewLink: dayEntry.attendanceFolderLink || null
-            }
-            : await ensureDriveFolder({
-                folderName: DRIVE_DAY_SUBFOLDERS.attendance,
-                parentFolderId: dayFolderId
-            });
-        const geoTagFolder = scheduleDoc?.geoTagFolderId
-            ? {
-                id: scheduleDoc.geoTagFolderId,
-                name: scheduleDoc.geoTagFolderName || DRIVE_DAY_SUBFOLDERS.geoTag,
-                webViewLink: scheduleDoc.geoTagFolderLink || null
-            }
-            : dayEntry?.geoTagFolderId
-            ? {
-                id: dayEntry.geoTagFolderId,
-                name: dayEntry.geoTagFolderName || DRIVE_DAY_SUBFOLDERS.geoTag,
-                webViewLink: dayEntry.geoTagFolderLink || null
-            }
-            : await ensureDriveFolder({
-                folderName: DRIVE_DAY_SUBFOLDERS.geoTag,
-                parentFolderId: dayFolderId
-            });
+        const resolvedFolders = await resolveCanonicalUploadFolders({
+            scheduleDoc,
+            dayEntry,
+            dayFolderId,
+            ensureDriveFolderLoader: ensureDriveFolder,
+        });
+        if (!resolvedFolders) return;
+        const { attendanceFolder, geoTagFolder } = resolvedFolders;
         const foldersByType = {
             attendance: toFolderAssetPayload(attendanceFolder, DRIVE_DAY_SUBFOLDERS.attendance),
             geoTag: toFolderAssetPayload(geoTagFolder, DRIVE_DAY_SUBFOLDERS.geoTag)
@@ -1041,7 +2006,12 @@ const syncAttendanceFilesToDrive = async ({
                 fieldName,
                 file,
                 index
-            })
+            }),
+            correlationId: resolvedCorrelationId,
+            attempt: resolvedAttempt,
+            scheduleId: scheduleId ? String(scheduleId) : null,
+            attendanceId: attendance?._id ? String(attendance._id) : null,
+            contextLabel,
         });
 
         if (!syncResult.files?.length) return;
@@ -1056,44 +2026,75 @@ const syncAttendanceFilesToDrive = async ({
             subFolders: foldersByType
         });
     } catch (error) {
-        console.error(
-            `[ATTENDANCE][DRIVE] Failed to sync ${contextLabel}:`,
-            {
-                message: error.message,
-                scheduleId: scheduleId || null,
-                attendanceId: attendance?._id || null,
-                dayFolderId: dayFolderId || null,
-                attendanceFolderId: scheduleDoc?.attendanceFolderId || dayEntry?.attendanceFolderId || null,
-                geoTagFolderId: scheduleDoc?.geoTagFolderId || dayEntry?.geoTagFolderId || null
-            }
-        );
+        logAttendanceAsyncTelemetry('error', {
+            correlationId: resolvedCorrelationId,
+            stage: 'drive_sync_failed',
+            scheduleId: scheduleId ? String(scheduleId) : null,
+            attendanceId: attendance?._id ? String(attendance._id) : null,
+            status: 'drive_sync',
+            outcome: 'failed',
+            attempt: resolvedAttempt,
+            cleanupMode: 'drive_sync',
+            reason: error.message,
+            contextLabel,
+        });
         attendance.driveAssets = markDriveSyncError(attendance.driveAssets, error);
     }
 };
 
 // Trainer uploads attendance with image and signature
 // Check In
-router.post('/check-in', uploadAttendance, async (req, res) => {
+const checkInHandler = async (req, res) => {
+    let checkInStage = 'initializing request';
+    const checkInCorrelationId = createCorrelationId('attendance_checkin');
     try {
-        console.log(`[CHECK-IN] Request received at ${new Date().toISOString()}`);
-        console.log(`[CHECK-IN] Body keys: ${Object.keys(req.body).join(', ')}`);
+        logAttendanceAsyncTelemetry('debug', {
+            correlationId: checkInCorrelationId,
+            stage: 'checkin_request_received',
+            status: 'checkin',
+            outcome: 'started',
+            reason: `bodyKeys=${Object.keys(req.body || {}).join(',')}`,
+            contextLabel: 'request',
+        });
         
         let { trainerId, collegeId, scheduleId, dayNumber, checkInTime, latitude, longitude, studentsPresent, studentsAbsent } = req.body;
         let checkInLocation = req.body.checkInLocation;
 
         if (req.files) {
-            console.log(`[CHECK-IN] Files: ${Object.keys(req.files).join(', ')}`);
+            logAttendanceAsyncTelemetry('debug', {
+                correlationId: checkInCorrelationId,
+                stage: 'checkin_files_received',
+                status: 'checkin',
+                outcome: 'received',
+                reason: `fileKeys=${Object.keys(req.files).join(',')}`,
+                contextLabel: 'request_files',
+            });
             if (req.files.attendancePdf) {
-                console.log(`[CHECK-IN] PDF: ${req.files.attendancePdf[0].originalname}, Size: ${req.files.attendancePdf[0].size} bytes`);
+                logAttendanceAsyncTelemetry('debug', {
+                    correlationId: checkInCorrelationId,
+                    stage: 'checkin_attendance_pdf_received',
+                    status: 'checkin',
+                    outcome: 'received',
+                    reason: `name=${req.files.attendancePdf[0].originalname};size=${req.files.attendancePdf[0].size}`,
+                    contextLabel: 'request_files',
+                });
             }
         }
 
         // Parse checkInLocation if it's a string (from FormData)
         if (typeof checkInLocation === 'string') {
+            checkInStage = 'parsing check-in location';
             try {
                 checkInLocation = JSON.parse(checkInLocation);
             } catch (e) {
-                console.error('Error parsing checkInLocation:', e);
+                logAttendanceAsyncTelemetry('warn', {
+                    correlationId: checkInCorrelationId,
+                    stage: 'checkin_location_parse_failed',
+                    status: 'checkin',
+                    outcome: 'failed',
+                    reason: e.message,
+                    contextLabel: checkInStage,
+                });
             }
         }
 
@@ -1105,7 +2106,7 @@ router.post('/check-in', uploadAttendance, async (req, res) => {
             });
         }
 
-        const schedule = await Schedule.findById(scheduleId).select('trainerId collegeId collegeLocation dayFolderId dayFolderName dayFolderLink attendanceFolderId attendanceFolderName attendanceFolderLink geoTagFolderId geoTagFolderName geoTagFolderLink driveFolderId driveFolderName driveFolderLink departmentId dayNumber');
+        const schedule = await Schedule.findById(scheduleId).select('trainerId collegeId collegeLocation dayFolderId dayFolderName dayFolderLink attendanceFolderId attendanceFolderName attendanceFolderLink geoTagFolderId geoTagFolderName geoTagFolderLink driveFolderId driveFolderName driveFolderLink departmentId dayNumber status isActive');
         if (!schedule) {
             return res.status(404).json({
                 success: false,
@@ -1117,7 +2118,8 @@ router.post('/check-in', uploadAttendance, async (req, res) => {
             schedule,
             trainerId,
             collegeId,
-            dayNumber
+            dayNumber,
+            correlationId: checkInCorrelationId
         });
         if (uploadAccessError) {
             return res.status(uploadAccessError.status).json({
@@ -1126,22 +2128,33 @@ router.post('/check-in', uploadAttendance, async (req, res) => {
             });
         }
 
+        const resolvedCollegeLocation = await resolveScheduleCollegeLocation(schedule);
+
         // 1. DISTANCE VALIDATION (HAIVERSINE)
         try {
-            if (schedule && schedule.collegeLocation && schedule.collegeLocation.lat && schedule.collegeLocation.lng) {
+            if (hasValidCollegeCoordinates(resolvedCollegeLocation)) {
                 const currentLat = checkInLocation?.lat || latitude;
                 const currentLng = checkInLocation?.lng || longitude;
 
                 if (currentLat && currentLng) {
                     const trainerLoc = { latitude: parseFloat(currentLat), longitude: parseFloat(currentLng) };
-                    const collegeLoc = { latitude: schedule.collegeLocation.lat, longitude: schedule.collegeLocation.lng };
-                    
-                    console.log(`[CHECK-IN] Calculating distance: Trainer(${trainerLoc.latitude}, ${trainerLoc.longitude}) to College(${collegeLoc.latitude}, ${collegeLoc.longitude})`);
-                    
+                    const collegeLoc = {
+                        latitude: resolvedCollegeLocation.lat,
+                        longitude: resolvedCollegeLocation.lng
+                    };
+
                     const distance = haversine(trainerLoc, collegeLoc);
 
                     if (distance > 300) {
-                        console.log(`[Geo-Fencing] Trainer is ${Math.round(distance)}m away (Validation Disabled)`);
+                        logAttendanceAsyncTelemetry('info', {
+                            correlationId: checkInCorrelationId,
+                            stage: 'checkin_geo_fence_distance_recorded',
+                            scheduleId: schedule?._id ? String(schedule._id) : null,
+                            status: 'geo_validation',
+                            outcome: 'outside_preferred_range',
+                            reason: `distanceMeters=${Math.round(distance)}`,
+                            contextLabel: 'distance_check',
+                        });
                         // return res.status(400).json({
                         //     success: false,
                         //     message: `Access Denied: You are ${Math.round(distance)} meters away. Please be within 300m of the college campus to check in.`,
@@ -1154,7 +2167,15 @@ router.post('/check-in', uploadAttendance, async (req, res) => {
                 }
             }
         } catch (distError) {
-            console.error('[CHECK-IN] Distance calculation failed (non-blocking):', distError);
+            logAttendanceAsyncTelemetry('warn', {
+                correlationId: checkInCorrelationId,
+                stage: 'checkin_distance_calculation_failed',
+                scheduleId: schedule?._id ? String(schedule._id) : null,
+                status: 'geo_validation',
+                outcome: 'failed',
+                reason: distError.message,
+                contextLabel: 'distance_check',
+            });
         }
 
         // LOCK: Prevent Check-In if Day is Completed
@@ -1172,6 +2193,7 @@ router.post('/check-in', uploadAttendance, async (req, res) => {
         // Parse student list if provided
         let students = [];
         if (req.body.studentList) {
+            checkInStage = 'parsing student list';
             try {
                 students = JSON.parse(req.body.studentList);
                 
@@ -1184,16 +2206,23 @@ router.post('/check-in', uploadAttendance, async (req, res) => {
                     }
                 }
             } catch (e) {
-                console.error('Error parsing studentList:', e);
+                logAttendanceAsyncTelemetry('warn', {
+                    correlationId: checkInCorrelationId,
+                    stage: 'checkin_student_list_parse_failed',
+                    status: 'checkin',
+                    outcome: 'failed',
+                    reason: e.message,
+                    contextLabel: checkInStage,
+                });
             }
         }
 
         // Check for existing attendance (e.g. for re-check-in after rejection)
-        console.log(`[CHECK-IN] Querying Attendance for scheduleId: ${scheduleId}`);
-        let attendance = await Attendance.findOne({ scheduleId });
+        checkInStage = 'loading attendance record';
+        let attendance = await Attendance.findOne({ scheduleId }).sort({ createdAt: -1 });
 
         if (attendance) {
-            console.log(`[CHECK-IN] Updating existing attendance ID: ${attendance._id}`);
+            checkInStage = 'updating existing attendance';
             // Update existing record
             attendance.checkInTime = checkInTime || new Date().toTimeString().split(' ')[0];
             if (attendancePdfUrl) attendance.attendancePdfUrl = attendancePdfUrl;
@@ -1213,11 +2242,44 @@ router.post('/check-in', uploadAttendance, async (req, res) => {
             attendance.studentsAbsent = studentsAbsent || 0;
             attendance.students = students; // Save student list
             attendance.verificationStatus = 'pending'; // Reset status to pending
+            attendance.geoVerificationStatus = 'pending';
+            attendance.geoValidationComment = null;
             attendance.status = 'Pending';
             attendance.rejectionReason = undefined; // Clear previous rejection reason
+            attendance.checkOutTime = null;
+            attendance.checkOutGeoImageUrl = null;
+            attendance.checkOutGeoImageUrls = [];
+            attendance.activityPhotos = [];
+            attendance.activityVideos = [];
+            attendance.images = [];
+            attendance.finalStatus = 'PENDING';
+            attendance.checkOutCapturedAt = null;
+            attendance.checkOutLatitude = null;
+            attendance.checkOutLongitude = null;
+            attendance.checkOutGeoDistanceMeters = null;
+            attendance.checkOutVerificationStatus = normalizeCheckOutVerificationStatus('pending_checkout');
+            attendance.checkOutVerificationMode = 'AUTO';
+            attendance.checkOutVerificationReason = null;
+            attendance.checkOutVerifiedAt = null;
+            attendance.checkOutVerifiedBy = null;
+            attendance.driveSyncStatus = 'PENDING';
+            attendance.checkOut = {
+                time: null,
+                finalStatus: 'PENDING',
+                location: {
+                    lat: null,
+                    lng: null,
+                    accuracy: null,
+                    address: null,
+                    distanceFromCollege: null
+                },
+                images: [],
+                photos: []
+            };
+            attendance.completedAt = null;
             if (req.body.syllabus) attendance.syllabus = req.body.syllabus; // Save syllabus
         } else {
-            console.log(`[CHECK-IN] Creating new attendance record`);
+            checkInStage = 'creating attendance';
             // Create new attendance record
             attendance = new Attendance({
                 trainerId,
@@ -1241,20 +2303,21 @@ router.post('/check-in', uploadAttendance, async (req, res) => {
                 studentsAbsent: studentsAbsent || 0,
                 students: students, // Save student list
                 verificationStatus: 'pending',
-                syllabus: req.body.syllabus || null // Save syllabus
+                syllabus: req.body.syllabus || null, // Save syllabus
+                checkOutVerificationStatus: normalizeCheckOutVerificationStatus('pending_checkout'),
+                checkOutVerificationMode: 'AUTO',
+                driveSyncStatus: 'PENDING',
             });
         }
 
-        await syncAttendanceFilesToDrive({
-            attendance,
-            scheduleId,
-            schedule,
-            filesByField: req.files,
-            contextLabel: 'check-in'
-        });
         await attendance.save();
+        const driveSyncQueued = queueStoredAttendanceDriveSync({
+            attendanceId: attendance._id,
+            contextLabel: 'check-in',
+            correlationId: checkInCorrelationId,
+        });
 
-        console.log(`[CHECK-IN] Updating Schedule ID: ${scheduleId}`);
+        checkInStage = 'updating schedule status';
         // Update Schedule status to 'inprogress' and update subject if provided
         const scheduleUpdate = { status: 'inprogress' };
         if (req.body.syllabus) {
@@ -1272,9 +2335,14 @@ router.post('/check-in', uploadAttendance, async (req, res) => {
             message: `Day status updated to ${dayState?.dayStatus || 'pending'}`
         });
 
-        console.log(`[CHECK-IN] Successful for ID: ${attendance._id}`);
+        await invalidateTrainerScheduleCaches([
+            attendance?.trainerId,
+            schedule?.trainerId,
+            trainerId,
+        ]);
 
         // Notify Admins
+        checkInStage = 'dispatching check-in notifications';
         try {
             const superAdmins = await User.find({ role: 'SuperAdmin' });
             const io = req.app.get('io');
@@ -1285,41 +2353,62 @@ router.post('/check-in', uploadAttendance, async (req, res) => {
                     title: 'New Attendance Check-In',
                     message: `A trainer has checked in.`,
                     type: 'Attendance',
-                    link: '/spoc/attendance' 
+                    link: '/dashboard/attendance' 
                 });
             });
         } catch (notifyErr) {
-            console.error('Failed to dispatch check-in notification:', notifyErr);
+            logAttendanceAsyncTelemetry('warn', {
+                correlationId: checkInCorrelationId,
+                stage: 'checkin_notification_failed',
+                trainerId: attendance?.trainerId ? String(attendance.trainerId) : null,
+                attendanceId: attendance?._id ? String(attendance._id) : null,
+                scheduleId: scheduleId ? String(scheduleId) : null,
+                status: 'checkin_notification',
+                outcome: 'failed',
+                reason: notifyErr.message,
+                contextLabel: checkInStage,
+            });
         }
 
         res.status(201).json({
             success: true,
-            message: attendance?.driveAssets?.lastSyncError
-                ? 'Check-in saved, but Drive sync failed'
+            message: driveSyncQueued
+                ? 'Check-in successful. Drive sync queued.'
                 : 'Check-in successful',
             driveSync: {
-                synced: !attendance?.driveAssets?.lastSyncError,
-                error: attendance?.driveAssets?.lastSyncError || null
+                queued: driveSyncQueued,
+                synced: false,
+                error: null
             },
             data: attendance
         });
     } catch (error) {
-        console.error('Error during check-in:', error);
+        logAttendanceAsyncTelemetry('error', {
+            correlationId: checkInCorrelationId,
+            stage: 'checkin_failed',
+            status: 'checkin',
+            outcome: 'failed',
+            reason: error?.message || 'Unknown error',
+            contextLabel: checkInStage,
+        });
         res.status(500).json({
             success: false,
             message: 'Failed to check in',
             error: error.message
         });
     }
-});
+};
+router.post('/check-in', uploadAttendance, checkInHandler);
 
 const uploadSingleGeoImageHandler = async (req, res) => {
     let uploadImageStage = 'initializing request';
+    const uploadCorrelationId = createCorrelationId('attendance_geo_upload');
 
     try {
         uploadImageStage = 'reading request payload';
         const rawTrainerId = String(req.body?.trainerId || '').trim();
-        const assignedDate = normalizeAssignedDateInput(req.body?.assignedDate);
+        const rawScheduleId = toIdString(req.body?.scheduleId);
+        const assignedDateInput = normalizeAssignedDateInput(req.body?.assignedDate);
         const imageIndex = Number.parseInt(req.body?.index, 10);
 
         if (!req.file?.path) {
@@ -1336,10 +2425,10 @@ const uploadSingleGeoImageHandler = async (req, res) => {
             });
         }
 
-        if (!assignedDate) {
+        if (!rawScheduleId && !assignedDateInput) {
             return res.status(400).json({
                 success: false,
-                message: 'assignedDate must be a valid YYYY-MM-DD value'
+                message: 'scheduleId or assignedDate is required to resolve the training day'
             });
         }
 
@@ -1368,12 +2457,44 @@ const uploadSingleGeoImageHandler = async (req, res) => {
         }
 
         uploadImageStage = 'loading assigned schedule';
-        const candidateSchedules = await Schedule.find({ trainerId: trainer._id })
-            .select('trainerId collegeId collegeLocation dayNumber status scheduledDate')
-            .sort({ scheduledDate: -1 });
-        const schedule = candidateSchedules.find(
-            (item) => toZonedDateKey(item?.scheduledDate) === assignedDate
-        ) || null;
+        let schedule = null;
+        const normalizedTrainerId = toIdString(trainer?._id);
+        const scheduleObjectId = toObjectIdOrNull(rawScheduleId);
+
+        if (rawScheduleId) {
+            if (!scheduleObjectId) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'scheduleId must be a valid schedule identifier'
+                });
+            }
+
+            schedule = await Schedule.findById(scheduleObjectId)
+                .select('trainerId collegeId collegeLocation dayNumber status scheduledDate isActive');
+
+            if (!schedule) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Assigned schedule not found'
+                });
+            }
+
+            if (toIdString(schedule?.trainerId) !== normalizedTrainerId) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Selected schedule does not belong to this trainer'
+                });
+            }
+        }
+
+        if (!schedule) {
+            const candidateSchedules = await Schedule.find({ trainerId: trainer._id })
+                .select('trainerId collegeId collegeLocation dayNumber status scheduledDate isActive')
+                .sort({ scheduledDate: -1 });
+            schedule = candidateSchedules.find(
+                (item) => toZonedDateKey(item?.scheduledDate) === assignedDateInput
+            ) || null;
+        }
 
         if (!schedule) {
             return res.status(404).json({
@@ -1382,10 +2503,34 @@ const uploadSingleGeoImageHandler = async (req, res) => {
             });
         }
 
-        if (!schedule?.collegeLocation?.lat || !schedule?.collegeLocation?.lng) {
+        const uploadAccessError = validateAssignedScheduleUpload({
+            schedule,
+            trainerId: normalizedTrainerId,
+            collegeId: schedule?.collegeId,
+            dayNumber: schedule?.dayNumber,
+            correlationId: uploadCorrelationId,
+        });
+        if (uploadAccessError) {
+            return res.status(uploadAccessError.status).json({
+                success: false,
+                message: uploadAccessError.message,
+            });
+        }
+
+        const assignedDate = toZonedDateKey(schedule?.scheduledDate) || assignedDateInput;
+        if (!assignedDate) {
             return res.status(400).json({
                 success: false,
-                message: 'College location is missing, so GeoTag validation cannot be completed.'
+                message: 'assignedDate must be a valid YYYY-MM-DD value'
+            });
+        }
+
+        const resolvedCollegeLocation = await resolveScheduleCollegeLocation(schedule);
+
+        if (!hasValidCollegeCoordinates(resolvedCollegeLocation)) {
+            return res.status(400).json({
+                success: false,
+                message: 'College location is missing. Please ask Super Admin to save the college map location before GeoTag verification.'
             });
         }
 
@@ -1398,121 +2543,196 @@ const uploadSingleGeoImageHandler = async (req, res) => {
             });
         }
 
-        uploadImageStage = 'extracting exif data';
+        const geoUploadSessionStateError = validateCheckOutSessionState({
+            attendance,
+            mode: 'geo-upload',
+        });
+        if (geoUploadSessionStateError) {
+            return res.status(geoUploadSessionStateError.status).json({
+                success: false,
+                message: geoUploadSessionStateError.message,
+            });
+        }
+
+        if (normalizeVerificationStatus(attendance?.verificationStatus, '') !== 'approved') {
+            return res.status(400).json({
+                success: false,
+                message: 'Check-in must be approved by SPOC before GeoTag upload is allowed.'
+            });
+        }
+
+        uploadImageStage = 'extracting exif and OCR data';
         const geoData = getGeoTagData(req.file.path);
-        const validation = geoData
-            ? verifyGeoTag({
-                geoData,
-                assignedDate,
-                collegeLocation: schedule.collegeLocation,
-                maxRadiusKm: CHECK_OUT_ALLOWED_GEO_RANGE_METERS / 1000,
-                businessTimeZone: ATTENDANCE_BUSINESS_TIMEZONE
-            })
-            : {
-                status: 'PENDING',
-                reason: 'No GPS found',
-                distance: null,
-                latitude: null,
-                longitude: null,
-                timestamp: null
-            };
+        const ocrData = await extractOcrStampData(req.file.path);
+        const validation = verifyGeoTag({
+            geoData,
+            ocrData,
+            assignedDate,
+            collegeLocation: resolvedCollegeLocation,
+            maxRadiusKm: CHECK_OUT_ALLOWED_GEO_RANGE_METERS / 1000,
+            businessTimeZone: ATTENDANCE_BUSINESS_TIMEZONE
+        });
+        const verificationReport = buildVerificationReportPayload(validation);
+
+        const exifDiagnostic = {
+            hasGpsLatitude: Number.isFinite(geoData?.latitude),
+            hasGpsLongitude: Number.isFinite(geoData?.longitude),
+            hasCapturedAt: geoData?.capturedAt instanceof Date,
+            hasGps: geoData?.hasGps === true,
+            missingFields: Array.isArray(validation.missingFields) ? validation.missingFields : [],
+        };
 
         const normalizedImageData = {
             image: path.basename(req.file.path),
-            latitude: Number.isFinite(geoData?.latitude) ? geoData.latitude : null,
-            longitude: Number.isFinite(geoData?.longitude) ? geoData.longitude : null,
+            latitude: Number.isFinite(validation?.latitude) ? validation.latitude : null,
+            longitude: Number.isFinite(validation?.longitude) ? validation.longitude : null,
             distance: Number.isFinite(validation?.distance) ? Number(validation.distance.toFixed(2)) : null,
-            status: validation.status === 'COMPLETED' ? 'VERIFIED' : 'PENDING'
+            status: validation.status === 'COMPLETED' ? 'VERIFIED' : 'PENDING',
+            reasonCode: validation.reasonCode || null,
         };
 
         const uploadedPhotoPayload = {
             url: req.file.path,
             uploadedAt: new Date(),
             validationStatus: normalizedImageData.status === 'VERIFIED' ? 'verified' : 'pending',
-            validationReason: normalizedImageData.status === 'VERIFIED' ? null : (validation.reason || 'No GPS found'),
+            validationReason: normalizedImageData.status === 'VERIFIED' ? null : (validation.reason || 'Validation pending'),
+            validationCode: validation.reasonCode || null,
             latitude: normalizedImageData.latitude,
             longitude: normalizedImageData.longitude,
             capturedAt: validation?.timestamp ? new Date(validation.timestamp * 1000) : null,
-            distanceKm: normalizedImageData.distance
+            distanceKm: normalizedImageData.distance,
+            validationSource: validation?.validationSource || null,
+            verificationReport,
+            exifDiagnostic,
         };
 
         uploadImageStage = 'updating attendance image slots';
-        const existingCheckOut = attendance.checkOut && typeof attendance.checkOut.toObject === 'function'
-            ? attendance.checkOut.toObject()
-            : (attendance.checkOut || {});
-        const imageSlots = ensureFixedLengthSlotArray(
-            Array.isArray(attendance.images) && attendance.images.length
-                ? attendance.images
-                : existingCheckOut.images,
-            3,
-            buildPendingCheckOutImageSlot
-        );
-        const photoSlots = ensureFixedLengthSlotArray(existingCheckOut.photos, 3, buildPendingCheckOutPhotoSlot);
+        const savedAttendance = await saveUploadedGeoImageSlot({
+            attendanceId: attendance._id,
+            assignedDate,
+            imageIndex,
+            normalizedImageData,
+            uploadedPhotoPayload
+        });
 
-        const existingImageSlot = imageSlots[imageIndex];
-        if (
-            String(existingImageSlot?.status || '').trim().toUpperCase() === 'VERIFIED'
-            && String(existingImageSlot?.image || '').trim()
-        ) {
-            if (req.file?.path && fs.existsSync(req.file.path)) {
-                fs.unlinkSync(req.file.path);
-            }
-            return res.status(409).json({
-                success: false,
-                message: `Image ${imageIndex + 1} is already verified and cannot be replaced`
-            });
-        }
+        uploadImageStage = 'queueing uploaded geo image for Google Drive sync';
+        const driveSyncQueued = queueStoredAttendanceDriveSync({
+            attendanceId: savedAttendance._id,
+            contextLabel: 'geo-slot-upload',
+            correlationId: uploadCorrelationId,
+        });
 
-        imageSlots[imageIndex] = normalizedImageData;
-        photoSlots[imageIndex] = uploadedPhotoPayload;
-
-        const nextFinalStatus = deriveUploadedImageFinalStatus(imageSlots);
-        const uploadedPhotoUrls = photoSlots
-            .map((item) => item?.url)
-            .filter((value) => typeof value === 'string' && value.trim());
-
-        attendance.assignedDate = assignedDate;
-        attendance.images = imageSlots;
-        attendance.finalStatus = nextFinalStatus;
-        attendance.checkOutGeoImageUrl = uploadedPhotoUrls[0] || null;
-        attendance.checkOutGeoImageUrls = uploadedPhotoUrls;
-        attendance.checkOut = {
-            ...existingCheckOut,
-            finalStatus: nextFinalStatus,
-            images: imageSlots,
-            photos: photoSlots
-        };
-
-        await attendance.save();
+        await invalidateTrainerScheduleCaches([
+            attendance?.trainerId,
+            schedule?.trainerId,
+            req.body?.trainerId,
+        ]);
 
         return res.json({
             success: true,
             message: validation.reason || (normalizedImageData.status === 'VERIFIED' ? 'Image verified' : 'Image pending'),
-            data: normalizedImageData,
-            images: attendance.images,
-            finalStatus: attendance.finalStatus,
-            checkOut: attendance.checkOut
+            data: {
+                ...normalizedImageData,
+                reason: validation.reason,
+                missingFields: exifDiagnostic.missingFields,
+            },
+            report: verificationReport,
+            exifDiagnostic,
+            images: savedAttendance.images,
+            finalStatus: savedAttendance.finalStatus,
+            assignedDate: savedAttendance.assignedDate || assignedDate,
+            geoVerificationStatus: savedAttendance.geoVerificationStatus || null,
+            geoValidationComment: savedAttendance.geoValidationComment ?? null,
+            checkOutVerificationStatus: savedAttendance.checkOutVerificationStatus || null,
+            checkOutVerificationMode: savedAttendance.checkOutVerificationMode || null,
+            checkOutVerificationReason: savedAttendance.checkOutVerificationReason ?? null,
+            checkOutCapturedAt: savedAttendance.checkOutCapturedAt || null,
+            checkOutLatitude: Number.isFinite(savedAttendance.checkOutLatitude)
+                ? savedAttendance.checkOutLatitude
+                : null,
+            checkOutLongitude: Number.isFinite(savedAttendance.checkOutLongitude)
+                ? savedAttendance.checkOutLongitude
+                : null,
+            checkOutGeoDistanceMeters: Number.isFinite(savedAttendance.checkOutGeoDistanceMeters)
+                ? savedAttendance.checkOutGeoDistanceMeters
+                : null,
+            driveSyncStatus: savedAttendance.driveSyncStatus || 'PENDING',
+            checkOut: savedAttendance.checkOut,
+            driveSync: {
+                queued: driveSyncQueued,
+                synced: false,
+                error: null
+            }
         });
     } catch (err) {
-        console.error(`Error during upload-image [stage=${uploadImageStage}]:`, err);
-        return res.status(500).json({
+        logAttendanceAsyncTelemetry('error', {
+            correlationId: uploadCorrelationId,
+            stage: 'geo_upload_failed',
+            status: 'geo_upload',
+            outcome: 'failed',
+            reason: err?.message || 'Unknown error',
+            contextLabel: uploadImageStage,
+        });
+        if (req.file?.path && fs.existsSync(req.file.path)) {
+            try {
+                fs.unlinkSync(req.file.path);
+            } catch (cleanupError) {
+                logAttendanceAsyncTelemetry('warn', {
+                    correlationId: uploadCorrelationId,
+                    stage: 'geo_upload_cleanup_failed',
+                    status: 'geo_upload_cleanup',
+                    outcome: 'failed',
+                    reason: cleanupError.message,
+                    cleanupMode: 'local_file',
+                    contextLabel: uploadImageStage,
+                });
+            }
+        }
+        return res.status(err.statusCode || 500).json({
             success: false,
-            message: `Failed to upload image during ${uploadImageStage}`,
+            message: err.statusCode ? err.message : `Failed to upload image during ${uploadImageStage}`,
             error: err.message,
             stage: uploadImageStage
         });
     }
 };
 
-router.post('/upload-image', uploadManual, uploadSingleGeoImageHandler);
+const uploadSingleGeoImageMiddleware = (req, res, next) => {
+    uploadGeoImage(req, res, (err) => {
+        if (!err) {
+            next();
+            return;
+        }
+
+        const isFileTooLarge = String(err?.code || '').toUpperCase() === 'LIMIT_FILE_SIZE';
+        const status = isFileTooLarge ? 413 : 400;
+        const message = isFileTooLarge
+            ? `GeoTag image is too large. Please upload an image smaller than ${GEO_IMAGE_MAX_SIZE_MB} MB.`
+            : (err?.message || 'Failed to upload GeoTag image');
+
+        res.status(status).json({
+            success: false,
+            message,
+            error: err?.message || null,
+            code: err?.code || 'UPLOAD_ERROR',
+        });
+    });
+};
+
+router.post('/upload-image', uploadSingleGeoImageMiddleware, uploadSingleGeoImageHandler);
 
 // Check Out
-router.post('/check-out', uploadAttendance, async (req, res) => {
+const checkOutHandler = async (req, res) => {
     let checkOutStage = 'initializing request';
+    const checkOutCorrelationId = createCorrelationId('attendance_checkout');
     try {
-        console.log(`[CHECK-OUT] Request received at ${new Date().toISOString()}`);
-        console.log(`[CHECK-OUT] Body keys: ${Object.keys(req.body || {}).join(', ')}`);
-        console.log(`[CHECK-OUT] Files: ${Object.keys(req.files || {}).join(', ')}`);
+        logAttendanceAsyncTelemetry('debug', {
+            correlationId: checkOutCorrelationId,
+            stage: 'checkout_request_received',
+            status: 'checkout',
+            outcome: 'started',
+            contextLabel: 'request',
+        });
 
         checkOutStage = 'reading request payload';
         const { scheduleId, trainerId, collegeId, dayNumber, checkOutTime, latitude, longitude, location } = req.body;
@@ -1524,7 +2744,14 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
             try {
                 checkOutLocation = JSON.parse(checkOutLocation);
             } catch (e) {
-                console.error('Error parsing checkOutLocation:', e);
+                logAttendanceAsyncTelemetry('warn', {
+                    correlationId: checkOutCorrelationId,
+                    stage: 'checkout_location_parse_failed',
+                    status: 'checkout',
+                    outcome: 'failed',
+                    reason: e.message,
+                    contextLabel: checkOutStage,
+                });
             }
         }
 
@@ -1536,10 +2763,24 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
         }
 
         checkOutStage = 'loading schedule';
-        const schedule = await Schedule.findById(scheduleId).select('trainerId collegeId collegeLocation dayNumber status scheduledDate');
+        const schedule = await Schedule.findById(scheduleId).select('trainerId collegeId collegeLocation dayNumber status scheduledDate isActive');
         let currentDistanceMeters = null;
         const currentLat = req.body.lat || checkOutLocation?.lat || latitude;
         const currentLng = req.body.lng || checkOutLocation?.lng || longitude;
+
+        const scheduleActionabilityError = validateAssignedScheduleUpload({
+            schedule,
+            trainerId,
+            collegeId,
+            dayNumber,
+            correlationId: checkOutCorrelationId,
+        });
+        if (scheduleActionabilityError) {
+            return res.status(scheduleActionabilityError.status).json({
+                success: false,
+                message: scheduleActionabilityError.message,
+            });
+        }
 
         if (!schedule?.scheduledDate) {
             return res.status(400).json({
@@ -1556,16 +2797,21 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
             });
         }
 
-        if (!schedule?.collegeLocation?.lat || !schedule?.collegeLocation?.lng) {
+        const resolvedCollegeLocation = await resolveScheduleCollegeLocation(schedule);
+
+        if (!hasValidCollegeCoordinates(resolvedCollegeLocation)) {
             return res.status(400).json({
                 success: false,
-                message: 'College location is missing, so GeoTag validation cannot be completed.'
+                message: 'College location is missing. Please ask Super Admin to save the college map location before GeoTag verification.'
             });
         }
 
         if (currentLat && currentLng) {
             const trainerLoc = { latitude: parseFloat(currentLat), longitude: parseFloat(currentLng) };
-            const collegeLoc = { latitude: schedule.collegeLocation.lat, longitude: schedule.collegeLocation.lng };
+            const collegeLoc = {
+                latitude: resolvedCollegeLocation.lat,
+                longitude: resolvedCollegeLocation.lng
+            };
             currentDistanceMeters = haversine(trainerLoc, collegeLoc);
 
             if (!Number.isFinite(currentDistanceMeters)) {
@@ -1583,7 +2829,7 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
 
         // Find attendance record for this schedule
         checkOutStage = 'loading attendance';
-        const attendance = await Attendance.findOne({ scheduleId });
+        const attendance = await Attendance.findOne({ scheduleId }).sort({ createdAt: -1 });
 
         if (!attendance) {
             return res.status(404).json({
@@ -1592,11 +2838,30 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
             });
         }
 
+        const checkOutSessionStateError = validateCheckOutSessionState({
+            attendance,
+            mode: 'check-out',
+        });
+        if (checkOutSessionStateError) {
+            return res.status(checkOutSessionStateError.status).json({
+                success: false,
+                message: checkOutSessionStateError.message,
+            });
+        }
+
+        if (normalizeVerificationStatus(attendance?.verificationStatus, '') !== 'approved') {
+            return res.status(400).json({
+                success: false,
+                message: 'Check-in must be approved by SPOC before check-out is allowed.'
+            });
+        }
+
         const uploadAccessError = validateAssignedScheduleUpload({
             schedule,
             trainerId: trainerId || attendance.trainerId,
             collegeId: collegeId || attendance.collegeId,
-            dayNumber: dayNumber || attendance.dayNumber
+            dayNumber: dayNumber || attendance.dayNumber,
+            correlationId: checkOutCorrelationId
         });
         if (uploadAccessError) {
             return res.status(uploadAccessError.status).json({
@@ -1630,17 +2895,36 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
                 3,
                 buildPendingCheckOutImageSlot
             );
-            const persistedPhotoSlots = ensureFixedLengthSlotArray(
-                existingCheckOut.photos,
+            const legacyPersistedPhotoSlots = ensureFixedLengthSlotArray(
+                Array.isArray(attendance.checkOutGeoImageUrls) && attendance.checkOutGeoImageUrls.length
+                    ? attendance.checkOutGeoImageUrls.map((url) => ({ url }))
+                    : (attendance.checkOutGeoImageUrl ? [{ url: attendance.checkOutGeoImageUrl }] : []),
                 3,
                 buildPendingCheckOutPhotoSlot
             );
-            const uploadedSlotCount = persistedImageSlots.filter((item) => String(item?.image || '').trim()).length;
+            const persistedPhotoSlots = ensureFixedLengthSlotArray(
+                Array.isArray(existingCheckOut.photos) && existingCheckOut.photos.length
+                    ? existingCheckOut.photos
+                    : legacyPersistedPhotoSlots,
+                3,
+                buildPendingCheckOutPhotoSlot
+            ).map((item, index) => {
+                const legacySlot = legacyPersistedPhotoSlots[index] || {};
+                return {
+                    ...legacySlot,
+                    ...item,
+                    url: item?.url || legacySlot?.url || null,
+                };
+            });
+            const uploadedSlotCount = Math.max(
+                persistedImageSlots.filter((item) => String(item?.image || '').trim()).length,
+                persistedPhotoSlots.filter((item) => String(item?.url || '').trim()).length
+            );
 
             if (uploadedSlotCount !== 3) {
                 return res.status(400).json({
                     success: false,
-                    message: 'Upload all 3 GeoTag images before submitting check-out.'
+                    message: `Only ${uploadedSlotCount} of 3 GeoTag images are stored for this check-out. Please upload the missing image again.`
                 });
             }
 
@@ -1667,30 +2951,58 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
                         : null,
                     latitude: Number.isFinite(item?.latitude) ? item.latitude : (Number.isFinite(persistedPhoto?.latitude) ? persistedPhoto.latitude : null),
                     longitude: Number.isFinite(item?.longitude) ? item.longitude : (Number.isFinite(persistedPhoto?.longitude) ? persistedPhoto.longitude : null),
+                    validationSource: persistedPhoto?.validationSource || persistedPhoto?.verificationReport?.source || null,
+                    report: persistedPhoto?.verificationReport || null,
                 };
             });
         } else {
-            imageGeoValidations = photoPaths.map((photoPath, index) => {
+            imageGeoValidations = await Promise.all(photoPaths.map(async (photoPath, index) => {
                 const geoData = getGeoTagData(photoPath);
+                const ocrData = await extractOcrStampData(photoPath);
                 const validation = verifyGeoTag({
                     geoData,
-                    assignedDate: schedule.scheduledDate,
-                    collegeLocation: schedule.collegeLocation,
+                    ocrData,
+                    assignedDate: assignedDateKey,
+                    collegeLocation: resolvedCollegeLocation,
                     maxRadiusKm: CHECK_OUT_ALLOWED_GEO_RANGE_METERS / 1000,
                     businessTimeZone: ATTENDANCE_BUSINESS_TIMEZONE
                 });
+                const verificationReport = buildVerificationReportPayload(validation);
 
                 return {
                     imageIndex: index + 1,
                     filePath: photoPath,
-                    ...validation
+                    ...validation,
+                    validationSource: validation?.validationSource || verificationReport?.source || null,
+                    report: verificationReport,
                 };
-            });
+            }));
         }
-        const pendingImageValidations = imageGeoValidations.filter((item) => item.status !== 'COMPLETED');
-        const checkOutValidationErrors = pendingImageValidations.map(
-            (item) => `Image ${item.imageIndex}: ${item.reason}`
+        const checkOutValidationFallbackReasons = imageGeoValidations
+            .filter((item) => item.status !== 'COMPLETED')
+            .map((item) => `Image ${item.imageIndex}: ${item.reason}`);
+        const checkOutEvidenceItems = imageGeoValidations.map((item) =>
+            toCheckOutEvidenceItem({
+                status: item.status,
+                reason: item.reason,
+                report: item.report,
+                distanceKm: Number.isFinite(item.distance) ? item.distance : null,
+                latitude: Number.isFinite(item.latitude) ? item.latitude : null,
+                longitude: Number.isFinite(item.longitude) ? item.longitude : null,
+                capturedAt: item.timestamp ? new Date(item.timestamp * 1000) : null,
+            }),
         );
+        const checkOutVerificationResult = buildCheckOutVerificationResult({
+            evidenceItems: checkOutEvidenceItems,
+            fallbackReasons: checkOutValidationFallbackReasons,
+        });
+        const checkOutValidationErrors = [...checkOutValidationFallbackReasons];
+        if (
+            checkOutVerificationResult.reason
+            && !checkOutValidationErrors.includes(checkOutVerificationResult.reason)
+        ) {
+            checkOutValidationErrors.push(checkOutVerificationResult.reason);
+        }
         const normalizedCheckOutImages = imageGeoValidations.map((item) => ({
             image: item.filePath ? path.basename(item.filePath) : null,
             latitude: Number.isFinite(item.latitude) ? item.latitude : null,
@@ -1718,25 +3030,44 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
             attendance.activityVideos = [...(attendance.activityVideos || []), ...req.files.activityVideos.map(f => f.path)];
         }
 
-        const checkOutAutoApproved = imageGeoValidations.length === 3 && pendingImageValidations.length === 0;
+        const checkOutAutoApproved = applyCheckOutVerificationResult({
+            attendance,
+            verificationResult: checkOutVerificationResult,
+        });
         const firstImageWithLocation = imageGeoValidations.find(
             (item) => Number.isFinite(item.latitude) && Number.isFinite(item.longitude)
         );
-        const summaryDistanceMeters = Number.isFinite(currentDistanceMeters)
-            ? currentDistanceMeters
+        const parsedCurrentLat = Number.parseFloat(currentLat);
+        const parsedCurrentLng = Number.parseFloat(currentLng);
+        const summaryDistanceMeters = Number.isFinite(checkOutVerificationResult.distanceMeters)
+            ? checkOutVerificationResult.distanceMeters
             : Number.isFinite(firstImageWithLocation?.distance)
-                ? firstImageWithLocation.distance * 1000
+            ? firstImageWithLocation.distance * 1000
+            : Number.isFinite(currentDistanceMeters)
+                ? currentDistanceMeters
                 : null;
 
         // Structured Geo-Tag (ANTI-FAKE)
         attendance.checkOut = {
             time: new Date(),
-            finalStatus: checkOutAutoApproved ? 'COMPLETED' : 'PENDING',
+            finalStatus: normalizeAttendanceFinalStatus(attendance.finalStatus, 'PENDING'),
             location: {
-                lat: req.body.lat || checkOutLocation?.lat || latitude || firstImageWithLocation?.latitude || null,
-                lng: req.body.lng || checkOutLocation?.lng || longitude || firstImageWithLocation?.longitude || null,
-                accuracy: req.body.accuracy || checkOutLocation?.accuracy,
-                address: req.body.address || checkOutLocation?.address || "College Campus",
+                lat: Number.isFinite(checkOutVerificationResult.latitude)
+                    ? checkOutVerificationResult.latitude
+                    : Number.isFinite(firstImageWithLocation?.latitude)
+                    ? firstImageWithLocation.latitude
+                    : (Number.isFinite(parsedCurrentLat) ? parsedCurrentLat : null),
+                lng: Number.isFinite(checkOutVerificationResult.longitude)
+                    ? checkOutVerificationResult.longitude
+                    : Number.isFinite(firstImageWithLocation?.longitude)
+                    ? firstImageWithLocation.longitude
+                    : (Number.isFinite(parsedCurrentLng) ? parsedCurrentLng : null),
+                accuracy: Number.isFinite(firstImageWithLocation?.latitude) && Number.isFinite(firstImageWithLocation?.longitude)
+                    ? null
+                    : (req.body.accuracy || checkOutLocation?.accuracy),
+                address: Number.isFinite(firstImageWithLocation?.latitude) && Number.isFinite(firstImageWithLocation?.longitude)
+                    ? "Geo-tag image location"
+                    : (req.body.address || checkOutLocation?.address || "College Campus"),
                 distanceFromCollege: summaryDistanceMeters
             },
             images: normalizedCheckOutImages,
@@ -1749,27 +3080,25 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
                 longitude: item.longitude,
                 capturedAt: item.timestamp ? new Date(item.timestamp * 1000) : null,
                 distanceKm: Number.isFinite(item.distance) ? item.distance : null,
+                validationSource: item.validationSource || item.report?.source || null,
+                verificationReport: item.report || null,
             }))
         };
         attendance.images = normalizedCheckOutImages;
-        attendance.finalStatus = checkOutAutoApproved ? 'COMPLETED' : 'PENDING';
-
-        attendance.geoVerificationStatus = checkOutAutoApproved ? 'approved' : 'pending';
-        attendance.geoValidationComment = checkOutValidationErrors.length ? checkOutValidationErrors.join(' ') : null;
-        attendance.status = checkOutAutoApproved ? 'Present' : 'Pending';
-        attendance.completedAt = checkOutAutoApproved ? new Date() : null;
-
-        checkOutStage = 'syncing files to Google Drive';
-        await syncAttendanceFilesToDrive({
-            attendance,
-            scheduleId,
-            schedule,
-            filesByField: req.files,
-            contextLabel: 'check-out'
-        });
+        // Keep today's presence tied to approved check-in. Check-out validation has its own geoVerificationStatus.
+        attendance.status = normalizeVerificationStatus(attendance?.verificationStatus, '') === 'approved'
+            ? 'Present'
+            : attendance.status;
+        attendance.driveSyncStatus = 'PENDING';
 
         checkOutStage = 'saving attendance record';
         await attendance.save();
+        checkOutStage = 'queueing persisted attendance files for Google Drive sync';
+        const driveSyncQueued = queueStoredAttendanceDriveSync({
+            attendanceId: attendance._id,
+            contextLabel: 'check-out-finalize',
+            correlationId: checkOutCorrelationId,
+        });
 
         checkOutStage = 'updating schedule status';
         await syncScheduleLifecycleStatusFromAttendance({
@@ -1789,6 +3118,12 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
             message: `Day status updated to ${dayState?.dayStatus || 'pending'}`
         });
 
+        await invalidateTrainerScheduleCaches([
+            attendance?.trainerId,
+            schedule?.trainerId,
+            trainerId,
+        ]);
+
         // Notify Admins
         try {
             const superAdmins = await User.find({ role: 'SuperAdmin' });
@@ -1800,24 +3135,35 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
                     title: 'New Attendance Check-Out',
                     message: `A trainer has checked out.`,
                     type: 'Attendance',
-                    link: '/spoc/attendance' 
+                    link: '/dashboard/attendance' 
                 });
             });
         } catch (notifyErr) {
-            console.error('Failed to dispatch check-out notification:', notifyErr);
+            logAttendanceAsyncTelemetry('warn', {
+                correlationId: checkOutCorrelationId,
+                stage: 'checkout_notification_failed',
+                trainerId: attendance?.trainerId ? String(attendance.trainerId) : null,
+                attendanceId: attendance?._id ? String(attendance._id) : null,
+                scheduleId: attendance?.scheduleId ? String(attendance.scheduleId) : null,
+                status: 'checkout_notification',
+                outcome: 'failed',
+                reason: notifyErr.message,
+                contextLabel: checkOutStage,
+            });
         }
 
         res.json({
             success: true,
-            message: attendance?.driveAssets?.lastSyncError
-                ? `Check-out saved, but Drive sync failed. Auto status: ${checkOutAutoApproved ? 'COMPLETED' : 'PENDING'}`
-                : `Check-out saved. Auto status: ${checkOutAutoApproved ? 'COMPLETED' : 'PENDING'}`,
+            message: `${checkOutAutoApproved ? 'Check-out auto-verified' : 'Check-out saved'}${driveSyncQueued ? '. Drive sync queued.' : '.'} Verification status: ${attendance.checkOutVerificationStatus || 'PENDING_CHECKOUT'}`,
             driveSync: {
-                synced: !attendance?.driveAssets?.lastSyncError,
-                error: attendance?.driveAssets?.lastSyncError || null
+                queued: driveSyncQueued,
+                synced: false,
+                error: null
             },
             autoValidation: {
-                status: checkOutAutoApproved ? 'completed' : 'pending',
+                status: checkOutAutoApproved
+                    ? 'completed'
+                    : String(attendance.checkOutVerificationStatus || 'PENDING_CHECKOUT').toLowerCase(),
                 reasons: checkOutValidationErrors,
                 verifiedImages: imageGeoValidations.filter((item) => item.status === 'COMPLETED').length,
                 totalImages: imageGeoValidations.length,
@@ -1828,19 +3174,42 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
                     timestamp: item.timestamp ?? null,
                     latitude: item.latitude,
                     longitude: item.longitude,
-                    distance: item.distance
+                    distance: item.distance,
+                    validationSource: item.validationSource || item.report?.source || null,
+                    report: item.report || null,
                 }))
             },
             checkoutRecord: {
                 trainerId: attendance.trainerId,
                 assignedDate: attendance.assignedDate,
                 images: attendance.images,
-                finalStatus: attendance.finalStatus
+                finalStatus: attendance.finalStatus,
+                checkOutVerificationStatus: attendance.checkOutVerificationStatus || null,
+                checkOutVerificationMode: attendance.checkOutVerificationMode || null,
+                checkOutVerificationReason: attendance.checkOutVerificationReason ?? null,
+                checkOutCapturedAt: attendance.checkOutCapturedAt || null,
+                checkOutLatitude: Number.isFinite(attendance.checkOutLatitude)
+                    ? attendance.checkOutLatitude
+                    : null,
+                checkOutLongitude: Number.isFinite(attendance.checkOutLongitude)
+                    ? attendance.checkOutLongitude
+                    : null,
+                checkOutGeoDistanceMeters: Number.isFinite(attendance.checkOutGeoDistanceMeters)
+                    ? attendance.checkOutGeoDistanceMeters
+                    : null,
+                driveSyncStatus: attendance.driveSyncStatus || 'PENDING',
             },
             data: attendance
         });
     } catch (error) {
-        console.error(`Error during check-out [stage=${checkOutStage}]:`, error);
+        logAttendanceAsyncTelemetry('error', {
+            correlationId: checkOutCorrelationId,
+            stage: 'checkout_failed',
+            status: 'checkout',
+            outcome: 'failed',
+            reason: error?.message || 'Unknown error',
+            contextLabel: checkOutStage,
+        });
         res.status(500).json({
             success: false,
             message: `Failed to check out during ${checkOutStage}`,
@@ -1848,75 +3217,231 @@ router.post('/check-out', uploadAttendance, async (req, res) => {
             stage: checkOutStage
         });
     }
-});
+};
+router.post('/check-out', uploadAttendance, checkOutHandler);
 
 // Get attendance by schedule ID
-router.get('/schedule/:scheduleId', async (req, res) => {
-    try {
-        const attendance = await Attendance.find({ scheduleId: req.params.scheduleId })
-            .populate('trainerId')
-            .populate('collegeId')
-            .populate('verifiedBy', 'id name')
-            .sort({ createdAt: -1 });
-
-        res.json({
-            success: true,
-            data: attendance
-        });
-    } catch (error) {
-        console.error('Error fetching attendance:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to fetch attendance',
-            error: error.message
-        });
-    }
-});
+router.get('/schedule/:scheduleId', getAttendanceScheduleController);
 
 // Get attendance by trainer ID
-router.get('/trainer/:trainerId', async (req, res) => {
-    try {
-        const { month, year } = req.query;
-        let filter = { trainerId: req.params.trainerId };
-
-        if (month && year) {
-            const startDate = new Date(year, month - 1, 1);
-            const endDate = new Date(year, month, 0);
-            filter.date = { $gte: startDate, $lte: endDate };
-        }
-
-        const attendance = await Attendance.find(filter)
-            .populate('collegeId', 'name')
-            .populate({
-                path: 'scheduleId',
-                populate: [
-                    { path: 'courseId', select: 'title' },
-                    { path: 'collegeId', select: 'name' }
-                ]
-            })
-            .sort({ date: -1 });
-
-        res.json({
-            success: true,
-            count: attendance.length,
-            data: attendance
-        });
-    } catch (error) {
-        console.error('Error fetching trainer attendance:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to fetch attendance',
-            error: error.message
-        });
-    }
-});
+router.get('/trainer/:trainerId', getAttendanceTrainerController);
 
 // Get all attendance records (for SPOC Admin verification page)
 router.get('/', async (req, res) => {
     try {
-        const attendance = await Attendance.find({})
+        const requestedView = String(req.query.view || '').trim().toLowerCase();
+        const page = parsePositiveInteger(req.query.page, 1);
+        const limit = Math.min(
+            parsePositiveInteger(req.query.limit, DEFAULT_ATTENDANCE_PAGE_LIMIT),
+            MAX_ATTENDANCE_PAGE_LIMIT
+        );
+        const shouldPaginate = shouldPaginateAttendance(req.query);
+        const verificationStatus = String(req.query.verificationStatus || '').trim().toLowerCase();
+        const geoVerificationStatus = String(req.query.geoVerificationStatus || '').trim().toLowerCase();
+        const checkOutVerificationStatus = String(req.query.checkOutVerificationStatus || '').trim();
+        const search = String(req.query.search || '').trim();
+        const startDate = parseAttendanceDateBoundary(req.query.startDate, 'start');
+        const endDate = parseAttendanceDateBoundary(req.query.endDate, 'end');
+        const filters = {};
+
+        if (requestedView === 'geo-verification') {
+            filters.checkOutTime = { $exists: true, $ne: null };
+        }
+
+        if (['pending', 'approved', 'rejected'].includes(verificationStatus)) {
+            filters.verificationStatus = verificationStatus;
+        }
+
+        if (['pending', 'approved', 'rejected'].includes(geoVerificationStatus)) {
+            filters.geoVerificationStatus = geoVerificationStatus;
+        }
+
+        if (checkOutVerificationStatus) {
+            const normalizedCheckOutStatus = normalizeCheckOutVerificationStatus(
+                checkOutVerificationStatus,
+                null,
+            );
+
+            if (normalizedCheckOutStatus === 'AUTO_VERIFIED') {
+                filters.checkOutVerificationStatus = 'AUTO_VERIFIED';
+            } else if (normalizedCheckOutStatus === 'MANUAL_REVIEW_REQUIRED') {
+                filters.checkOutVerificationStatus = 'MANUAL_REVIEW_REQUIRED';
+            } else if (normalizedCheckOutStatus === 'REJECTED') {
+                filters.checkOutVerificationStatus = 'REJECTED';
+            } else if (
+                normalizedCheckOutStatus === 'PENDING_CHECKOUT'
+                || ['pending', 'in_progress', 'under_review'].includes(
+                    String(checkOutVerificationStatus).trim().toLowerCase().replace(/[\s-]+/g, '_'),
+                )
+            ) {
+                filters.checkOutVerificationStatus = {
+                    $in: ['PENDING_CHECKOUT', 'MANUAL_REVIEW_REQUIRED'],
+                };
+            }
+        }
+
+        if (req.query.startDate && !startDate) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid startDate. Use a valid date or YYYY-MM-DD format.'
+            });
+        }
+
+        if (req.query.endDate && !endDate) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid endDate. Use a valid date or YYYY-MM-DD format.'
+            });
+        }
+
+        if (startDate || endDate) {
+            filters.date = {};
+            if (startDate) {
+                filters.date.$gte = startDate;
+            }
+            if (endDate) {
+                filters.date.$lte = endDate;
+            }
+        }
+
+        const searchFilters = await buildAttendanceSearchFilters(search);
+        if (searchFilters.length > 0) {
+            filters.$or = searchFilters;
+        } else if (search) {
+            return res.json({
+                success: true,
+                data: [],
+                pagination: {
+                    page,
+                    limit,
+                    total: 0,
+                    totalPages: 0,
+                    hasNextPage: false,
+                    hasPrevPage: page > 1,
+                }
+            });
+        }
+
+        if (requestedView === 'geo-verification') {
+            const attendanceQuery = Attendance.find(filters)
+                .select([
+                    'trainerId',
+                    'collegeId',
+                    'courseId',
+                    'scheduleId',
+                    'dayNumber',
+                    'assignedDate',
+                    'date',
+                    'geoVerificationStatus',
+                    'geoValidationComment',
+                    'checkOutVerificationStatus',
+                    'checkOutVerificationMode',
+                    'checkOutVerificationReason',
+                    'checkOutCapturedAt',
+                    'checkOutLatitude',
+                    'checkOutLongitude',
+                    'checkOutGeoDistanceMeters',
+                    'checkOutVerifiedAt',
+                    'driveSyncStatus',
+                    'checkOutTime',
+                    ...ATTENDANCE_LIST_CHECK_OUT_SELECT_FIELDS,
+                    'checkOutGeoImageUrl',
+                    'checkOutGeoImageUrls',
+                    'activityPhotos',
+                    'activityVideos',
+                    'latitude',
+                    'longitude',
+                    'createdAt',
+                    'status'
+                ].join(' '))
+                .populate({
+                    path: 'trainerId',
+                    select: 'name trainerId userId',
+                    populate: { path: 'userId', select: 'name email' }
+                })
+                .populate({
+                    path: 'collegeId',
+                    select: 'name latitude longitude companyId',
+                    populate: { path: 'companyId', select: 'name' }
+                })
+                .populate({
+                    path: 'courseId',
+                    select: 'name title'
+                })
+                .populate({
+                    path: 'scheduleId',
+                    select: 'subject dayNumber courseId',
+                    populate: { path: 'courseId', select: 'name title' }
+                })
+                .sort({ date: -1, createdAt: -1 })
+                .lean();
+
+            let totalPromise = Promise.resolve(null);
+            if (shouldPaginate) {
+                attendanceQuery.skip((page - 1) * limit).limit(limit);
+                totalPromise = Attendance.countDocuments(filters);
+            }
+
+            const [attendance, total] = await Promise.all([
+                attendanceQuery,
+                totalPromise,
+            ]);
+
+            const responsePayload = {
+                success: true,
+                data: attendance
+            };
+
+            if (shouldPaginate) {
+                const totalPages = total > 0 ? Math.ceil(total / limit) : 0;
+                responsePayload.pagination = {
+                    page,
+                    limit,
+                    total,
+                    totalPages,
+                    hasNextPage: page < totalPages,
+                    hasPrevPage: page > 1,
+                };
+            }
+
+            return res.json(responsePayload);
+        }
+
+        const attendanceQuery = Attendance.find(filters)
+            .select([
+                '_id',
+                'trainerId',
+                'collegeId',
+                'scheduleId',
+                'dayNumber',
+                'assignedDate',
+                'date',
+                'checkIn',
+                'checkInTime',
+                'checkOutTime',
+                'studentsPresent',
+                'studentsAbsent',
+                'verificationStatus',
+                'geoVerificationStatus',
+                'geoValidationComment',
+                'checkOutVerificationStatus',
+                'checkOutVerificationMode',
+                'checkOutVerificationReason',
+                'checkOutCapturedAt',
+                'checkOutLatitude',
+                'checkOutLongitude',
+                'checkOutGeoDistanceMeters',
+                'driveSyncStatus',
+                ...ATTENDANCE_LIST_CHECK_OUT_SELECT_FIELDS,
+                'checkOutGeoImageUrl',
+                'checkOutGeoImageUrls',
+                'attendancePdfUrl',
+                'createdAt',
+                'status'
+            ].join(' '))
             .populate({
                 path: 'trainerId',
+                select: 'name trainerId userId',
                 populate: { path: 'userId', select: 'name email' }
             })
             .populate({
@@ -1926,14 +3451,41 @@ router.get('/', async (req, res) => {
             })
             .populate({
                 path: 'scheduleId',
-                populate: { path: 'courseId', select: 'name' }
+                select: 'dayNumber subject courseId',
+                populate: { path: 'courseId', select: 'name title' }
             })
-            .sort({ createdAt: -1 });
+            .sort({ createdAt: -1 })
+            .lean();
 
-        res.json({
+        let totalPromise = Promise.resolve(null);
+        if (shouldPaginate) {
+            attendanceQuery.skip((page - 1) * limit).limit(limit);
+            totalPromise = Attendance.countDocuments(filters);
+        }
+
+        const [attendance, total] = await Promise.all([
+            attendanceQuery,
+            totalPromise,
+        ]);
+
+        const responsePayload = {
             success: true,
             data: attendance
-        });
+        };
+
+        if (shouldPaginate) {
+            const totalPages = total > 0 ? Math.ceil(total / limit) : 0;
+            responsePayload.pagination = {
+                page,
+                limit,
+                total,
+                totalPages,
+                hasNextPage: page < totalPages,
+                hasPrevPage: page > 1,
+            };
+        }
+
+        res.json(responsePayload);
     } catch (error) {
         console.error('Error fetching attendance:', error);
         res.status(500).json({
@@ -1943,6 +3495,9 @@ router.get('/', async (req, res) => {
         });
     }
 });
+
+// Get attendance details by ID (for detail modal)
+router.get('/:id/details', getAttendanceLegacyDetailsController);
 
 // Get pending attendance for verification
 router.get('/pending', async (req, res) => {
@@ -1974,277 +3529,27 @@ router.get('/pending', async (req, res) => {
 });
 
 // Get uploaded drive documents tracked per schedule/day
-router.get('/documents', async (req, res) => {
-    try {
-        const { scheduleId, attendanceId, trainerId, status, fileType } = req.query;
-        const filters = {};
-
-        const objectIdParams = [
-            ['scheduleId', scheduleId],
-            ['attendanceId', attendanceId],
-            ['trainerId', trainerId]
-        ];
-        for (const [key, value] of objectIdParams) {
-            if (!value) continue;
-            if (!mongoose.Types.ObjectId.isValid(value)) {
-                return res.status(400).json({
-                    success: false,
-                    message: `Invalid ${key}`
-                });
-            }
-            filters[key] = value;
-        }
-
-        if (status) {
-            const normalizedStatus = String(status).trim().toLowerCase();
-            if (!['pending', 'verified', 'rejected'].includes(normalizedStatus)) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Invalid status filter. Use pending, verified, or rejected.'
-                });
-            }
-            filters.status = normalizedStatus;
-        }
-
-        if (fileType) {
-            const normalizedFileType = String(fileType).trim().toLowerCase();
-            if (!['attendance', 'geotag', 'other'].includes(normalizedFileType)) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Invalid fileType filter. Use attendance, geotag, or other.'
-                });
-            }
-            filters.fileType = normalizedFileType;
-        }
-
-        const documents = await ScheduleDocument.find(filters)
-            .populate('attendanceId', 'verificationStatus geoVerificationStatus status date')
-            .populate({
-                path: 'trainerId',
-                select: 'userId trainerCode',
-                populate: { path: 'userId', select: 'name email' }
-            })
-            .populate('scheduleId', 'companyId courseId collegeId departmentId dayNumber scheduledDate startTime endTime status')
-            .populate('verifiedBy', 'name email role')
-            .sort({ createdAt: -1 });
-
-        res.json({
-            success: true,
-            count: documents.length,
-            data: documents
-        });
-    } catch (error) {
-        console.error('Error fetching attendance documents:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to fetch attendance documents',
-            error: error.message
-        });
-    }
-});
+router.get('/documents', getAttendanceDocumentsController);
 
 // SPOC verifies uploaded document
-router.post('/verify-document', async (req, res) => {
-    try {
-        const { documentId, spocId } = req.body;
-        if (!documentId || !mongoose.Types.ObjectId.isValid(documentId)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Valid documentId is required'
-            });
-        }
-
-        const verifiedBy = spocId || req.user?.id || null;
-        if (verifiedBy && !mongoose.Types.ObjectId.isValid(verifiedBy)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid spocId'
-            });
-        }
-
-        const document = await ScheduleDocument.findById(documentId);
-        if (!document) {
-            return res.status(404).json({
-                success: false,
-                message: 'Document not found'
-            });
-        }
-
-        document.status = 'verified';
-        document.verifiedBy = verifiedBy || null;
-        document.verifiedAt = new Date();
-        document.rejectReason = null;
-        await document.save();
-
-        if (document.scheduleId) {
-            const attendance = document.attendanceId
-                ? await Attendance.findById(document.attendanceId)
-                : await Attendance.findOne({ scheduleId: document.scheduleId }).sort({ createdAt: -1 });
-            const dayState = await syncScheduleDayState({
-                scheduleId: document.scheduleId,
-                attendance
-            });
-            emitAttendanceRealtimeUpdate(req, {
-                type: 'DOCUMENT_VERIFICATION_UPDATE',
-                scheduleId: document.scheduleId,
-                attendanceId: document.attendanceId || null,
-                dayStatus: dayState?.dayStatus || null,
-                attendanceUploaded: dayState?.attendanceUploaded ?? null,
-                geoTagUploaded: dayState?.geoTagUploaded ?? null,
-                message: 'Document verified successfully'
-            });
-        }
-
-        res.json({
-            success: true,
-            message: 'Document verified successfully',
-            data: document
-        });
-    } catch (error) {
-        console.error('Error verifying attendance document:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to verify document',
-            error: error.message
-        });
-    }
+const verifyAttendanceDocumentAdapter = createVerifyAttendanceDocumentController({
+    syncScheduleDayStateHelper: syncScheduleDayState,
+    emitRealtimeUpdateHelper: emitAttendanceRealtimeUpdate
 });
+router.post('/verify-document', verifyAttendanceDocumentAdapter);
 
 // SPOC rejects uploaded document
-router.post('/reject-document', async (req, res) => {
-    try {
-        const { documentId, spocId, rejectReason } = req.body;
-        if (!documentId || !mongoose.Types.ObjectId.isValid(documentId)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Valid documentId is required'
-            });
-        }
-
-        const verifiedBy = spocId || req.user?.id || null;
-        if (verifiedBy && !mongoose.Types.ObjectId.isValid(verifiedBy)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid spocId'
-            });
-        }
-
-        const document = await ScheduleDocument.findById(documentId);
-        if (!document) {
-            return res.status(404).json({
-                success: false,
-                message: 'Document not found'
-            });
-        }
-
-        document.status = 'rejected';
-        document.verifiedBy = verifiedBy || null;
-        document.verifiedAt = new Date();
-        document.rejectReason = rejectReason || 'Rejected by SPOC';
-        await document.save();
-
-        if (document.scheduleId) {
-            const attendance = document.attendanceId
-                ? await Attendance.findById(document.attendanceId)
-                : await Attendance.findOne({ scheduleId: document.scheduleId }).sort({ createdAt: -1 });
-            const dayState = await syncScheduleDayState({
-                scheduleId: document.scheduleId,
-                attendance,
-                dayStatusOverride: 'pending'
-            });
-            emitAttendanceRealtimeUpdate(req, {
-                type: 'DOCUMENT_VERIFICATION_UPDATE',
-                scheduleId: document.scheduleId,
-                attendanceId: document.attendanceId || null,
-                dayStatus: dayState?.dayStatus || null,
-                attendanceUploaded: dayState?.attendanceUploaded ?? null,
-                geoTagUploaded: dayState?.geoTagUploaded ?? null,
-                message: 'Document rejected successfully'
-            });
-        }
-
-        res.json({
-            success: true,
-            message: 'Document rejected successfully',
-            data: document
-        });
-    } catch (error) {
-        console.error('Error rejecting attendance document:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to reject document',
-            error: error.message
-        });
-    }
+const rejectAttendanceDocumentAdapter = createRejectAttendanceDocumentController({
+    syncScheduleDayStateHelper: syncScheduleDayState,
+    emitRealtimeUpdateHelper: emitAttendanceRealtimeUpdate
 });
+router.post('/reject-document', rejectAttendanceDocumentAdapter);
 
-// Manual attendance entry (SPOC Admin)
-router.post('/manual', uploadManual, async (req, res) => {
-    try {
-        const {
-            trainerId,
-            collegeId,
-            scheduleId,
-            dayNumber,
-            date,
-            status,
-            remarks,
-            studentsPresent,
-            studentsAbsent,
-            syllabus
-        } = req.body;
-
-        if (!trainerId || !collegeId || !date) {
-            return res.status(400).json({
-                success: false,
-                message: 'Trainer ID, College ID, and Date are required'
-            });
-        }
-
-        const attendance = await Attendance.create({
-            trainerId,
-            collegeId,
-            scheduleId: scheduleId || null,
-            dayNumber: dayNumber || null,
-            date: new Date(date),
-            status: status || 'Present',
-            remarks,
-            uploadedBy: 'admin',
-            isManualEntry: true,
-            studentsPresent: studentsPresent || 0,
-            studentsAbsent: studentsAbsent || 0,
-            verificationStatus: 'approved',
-            verifiedAt: new Date(),
-            syllabus: syllabus || null
-        });
-
-        if (scheduleId) {
-            const dayState = await syncScheduleDayState({ scheduleId, attendance });
-            emitAttendanceRealtimeUpdate(req, {
-                type: 'DAY_STATUS_UPDATE',
-                scheduleId,
-                attendanceId: attendance._id,
-                dayStatus: dayState?.dayStatus || null,
-                attendanceUploaded: dayState?.attendanceUploaded ?? null,
-                geoTagUploaded: dayState?.geoTagUploaded ?? null,
-                message: `Day status updated to ${dayState?.dayStatus || 'pending'}`
-            });
-        }
-
-        res.status(201).json({
-            success: true,
-            message: 'Manual attendance created successfully',
-            data: attendance
-        });
-    } catch (error) {
-        console.error('Error creating manual attendance:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to create manual attendance',
-            error: error.message
-        });
-    }
+const markManualAttendanceAdapter = createMarkManualAttendanceController({
+    syncScheduleDayStateHelper: syncScheduleDayState,
+    emitRealtimeUpdateHelper: emitAttendanceRealtimeUpdate
 });
+router.post('/manual', uploadManual, markManualAttendanceAdapter);
 
 // Daily attendance entry for HR (no college required)
 router.post('/trainer-daily', async (req, res) => {
@@ -2258,7 +3563,6 @@ router.post('/trainer-daily', async (req, res) => {
             });
         }
 
-        // Check if attendance already exists for this trainer and date
         const startOfDay = new Date(date);
         startOfDay.setHours(0, 0, 0, 0);
         const endOfDay = new Date(date);
@@ -2267,13 +3571,13 @@ router.post('/trainer-daily', async (req, res) => {
         let attendance = await Attendance.findOne({
             trainerId,
             date: { $gte: startOfDay, $lte: endOfDay },
-            collegeId: null // Only check for general attendance
+            collegeId: null
         });
 
         if (attendance) {
             attendance.status = status;
             attendance.remarks = remarks;
-            attendance.verifiedAt = new Date(); // Auto-verify
+            attendance.verifiedAt = new Date();
             await attendance.save();
         } else {
             attendance = await Attendance.create({
@@ -2285,7 +3589,7 @@ router.post('/trainer-daily', async (req, res) => {
                 isManualEntry: true,
                 verificationStatus: 'approved',
                 verifiedAt: new Date(),
-                collegeId: null // Explicitly null for general attendance
+                collegeId: null
             });
         }
 
@@ -2305,44 +3609,37 @@ router.post('/trainer-daily', async (req, res) => {
 });
 
 // Get attendance by college
-router.get('/college/:collegeId', async (req, res) => {
-    try {
-        const attendance = await Attendance.find({ collegeId: req.params.collegeId })
-            .populate('trainerId')
-            .populate('scheduleId')
-            .populate('verifiedBy', 'name')
-            .sort({ date: -1 });
-
-        res.json({
-            success: true,
-            data: attendance
-        });
-    } catch (error) {
-        console.error('Error fetching college attendance:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to fetch attendance',
-            error: error.message
-        });
-    }
-});
+router.get('/college/:collegeId', getAttendanceCollegeController);
 
 // Admin uploads/updates attendance (PDF, Image, GeoTag)
 router.post('/admin-upload', uploadAttendance, async (req, res) => {
+    let adminUploadStage = 'initializing request';
+    const adminUploadCorrelationId = createCorrelationId('attendance_admin_upload');
     try {
+        adminUploadStage = 'reading request payload';
         const { scheduleId, trainerId, collegeId, latitude, longitude, date } = req.body;
+        const requestedVerificationStatus = normalizeVerificationStatus(
+            req.body.verificationStatus,
+            null
+        );
+        const requestedGeoVerificationStatus = normalizeVerificationStatus(
+            req.body.geoVerificationStatus,
+            null
+        );
 
 
 
         if (!scheduleId) {
             return res.status(400).json({ success: false, message: 'Schedule ID is required' });
         }
+        adminUploadStage = 'loading schedule';
         const schedule = await Schedule.findById(scheduleId).select('dayFolderId dayFolderName dayFolderLink attendanceFolderId attendanceFolderName attendanceFolderLink geoTagFolderId geoTagFolderName geoTagFolderLink driveFolderId driveFolderName driveFolderLink departmentId dayNumber');
         if (!schedule) {
             return res.status(404).json({ success: false, message: 'Schedule not found' });
         }
 
-        let attendance = await Attendance.findOne({ scheduleId });
+        adminUploadStage = 'loading attendance';
+        let attendance = await Attendance.findOne({ scheduleId }).sort({ createdAt: -1 });
 
         const attendancePdfUrl = req.files?.attendancePdf ? req.files.attendancePdf[0].path : undefined;
         const attendanceExcelUrl = req.files?.attendanceExcel ? req.files.attendanceExcel[0].path : undefined;
@@ -2356,6 +3653,7 @@ router.post('/admin-upload', uploadAttendance, async (req, res) => {
         }
 
         if (attendance) {
+            adminUploadStage = 'updating attendance';
             // Update existing
             if (attendancePdfUrl) attendance.attendancePdfUrl = attendancePdfUrl;
             if (attendanceExcelUrl) attendance.attendanceExcelUrl = attendanceExcelUrl;
@@ -2364,28 +3662,52 @@ router.post('/admin-upload', uploadAttendance, async (req, res) => {
                 attendance.checkOutGeoImageUrls = checkOutGeoImageUrls;
                 attendance.checkOutGeoImageUrl = checkOutGeoImageUrl;
                 // Reset verification status if new images are uploaded
-                attendance.geoVerificationStatus = 'pending';
+                attendance.geoVerificationStatus = normalizeVerificationStatus('pending');
+                attendance.checkOutVerificationStatus = normalizeCheckOutVerificationStatus('manual_review_required');
+                attendance.checkOutVerificationMode = 'MANUAL';
+                attendance.checkOutVerificationReason = 'Uploaded by admin. Manual verification required.';
+                attendance.checkOutVerifiedAt = null;
+                attendance.checkOutVerifiedBy = null;
             }
             if (latitude) attendance.latitude = latitude;
             if (longitude) attendance.longitude = longitude;
 
             // Update statuses if provided
-            if (req.body.verificationStatus) {
-                attendance.verificationStatus = req.body.verificationStatus;
+            if (requestedVerificationStatus) {
+                attendance.verificationStatus = requestedVerificationStatus;
             }
-            if (req.body.geoVerificationStatus) {
-                attendance.geoVerificationStatus = req.body.geoVerificationStatus;
+            if (requestedGeoVerificationStatus) {
+                attendance.geoVerificationStatus = requestedGeoVerificationStatus;
+                attendance.checkOutVerificationMode = 'MANUAL';
+                attendance.checkOutVerificationStatus =
+                    requestedGeoVerificationStatus === 'approved'
+                        ? normalizeCheckOutVerificationStatus('auto_verified')
+                        : requestedGeoVerificationStatus === 'rejected'
+                            ? normalizeCheckOutVerificationStatus('rejected')
+                            : normalizeCheckOutVerificationStatus('manual_review_required');
+                attendance.checkOutVerificationReason =
+                    requestedGeoVerificationStatus === 'approved'
+                        ? null
+                        : requestedGeoVerificationStatus === 'rejected'
+                            ? 'Manually rejected by admin'
+                            : 'Manual review pending';
+                attendance.checkOutVerifiedAt = requestedGeoVerificationStatus === 'approved'
+                    ? new Date()
+                    : null;
+                attendance.checkOutVerifiedBy = req.user?.id || null;
                 // Sync main status with Geo Tag status
-                if (req.body.geoVerificationStatus === 'approved') {
-                    attendance.status = 'Present';
-                } else if (req.body.geoVerificationStatus === 'rejected') {
-                    attendance.status = 'Absent';
+                if (requestedGeoVerificationStatus === 'approved') {
+                    attendance.status = normalizeAttendancePresenceStatus('present');
+                } else if (requestedGeoVerificationStatus === 'rejected') {
+                    attendance.status = normalizeAttendancePresenceStatus('absent');
                 }
             }
             
             if (req.body.syllabus) attendance.syllabus = req.body.syllabus;
+            attendance.driveSyncStatus = 'PENDING';
 
         } else {
+            adminUploadStage = 'creating attendance';
             // Create new
             if (!trainerId || !collegeId) {
                 return res.status(400).json({ success: false, message: 'Trainer ID and College ID are required for new attendance' });
@@ -2403,24 +3725,55 @@ router.post('/admin-upload', uploadAttendance, async (req, res) => {
                 longitude,
                 checkOutGeoImageUrl,
                 checkOutGeoImageUrls,
-                verificationStatus: req.body.verificationStatus || 'pending',
-                geoVerificationStatus: req.body.geoVerificationStatus || 'pending',
-                status: req.body.geoVerificationStatus === 'approved' ? 'Present' : (req.body.geoVerificationStatus === 'rejected' ? 'Absent' : 'Pending'),
+                verificationStatus: requestedVerificationStatus || normalizeVerificationStatus('pending'),
+                geoVerificationStatus: requestedGeoVerificationStatus || normalizeVerificationStatus('pending'),
+                checkOutVerificationStatus:
+                    (requestedGeoVerificationStatus || 'pending') === 'approved'
+                        ? normalizeCheckOutVerificationStatus('auto_verified')
+                        : (requestedGeoVerificationStatus || 'pending') === 'rejected'
+                            ? normalizeCheckOutVerificationStatus('rejected')
+                            : normalizeCheckOutVerificationStatus(
+                                checkOutGeoImageUrls?.length ? 'manual_review_required' : 'pending_checkout'
+                            ),
+                checkOutVerificationMode: requestedGeoVerificationStatus ? 'MANUAL' : 'AUTO',
+                checkOutVerificationReason:
+                    (requestedGeoVerificationStatus || 'pending') === 'approved'
+                        ? null
+                        : (requestedGeoVerificationStatus || 'pending') === 'rejected'
+                            ? 'Manually rejected by admin'
+                            : checkOutGeoImageUrls?.length
+                                ? 'Uploaded by admin. Manual verification required.'
+                                : null,
+                checkOutVerifiedAt: (requestedGeoVerificationStatus || 'pending') === 'approved'
+                    ? new Date()
+                    : null,
+                checkOutVerifiedBy: req.user?.id || null,
+                status: normalizeAttendancePresenceStatus(
+                    (requestedGeoVerificationStatus || 'pending') === 'approved'
+                        ? 'present'
+                        : (requestedGeoVerificationStatus || 'pending') === 'rejected'
+                            ? 'absent'
+                            : 'pending'
+                ),
                 verifiedBy: req.user ? req.user.id : undefined,
-                verifiedAt: (req.body.verificationStatus === 'approved' || req.body.geoVerificationStatus === 'approved') ? new Date() : undefined,
-                uploadedBy: 'admin'
+                verifiedAt: (
+                    (requestedVerificationStatus || 'pending') === 'approved'
+                    || (requestedGeoVerificationStatus || 'pending') === 'approved'
+                ) ? new Date() : undefined,
+                uploadedBy: 'admin',
+                driveSyncStatus: 'PENDING',
             });
 
         }
 
-        await syncAttendanceFilesToDrive({
-            attendance,
-            scheduleId,
-            schedule,
-            filesByField: req.files,
-            contextLabel: 'admin-upload'
-        });
         await attendance.save();
+        adminUploadStage = 'queueing drive sync';
+        const driveSyncQueued = queueStoredAttendanceDriveSync({
+            attendanceId: attendance._id,
+            contextLabel: 'admin-upload',
+            correlationId: adminUploadCorrelationId,
+        });
+        adminUploadStage = 'syncing day state';
         const dayState = await syncScheduleDayState({ scheduleId, attendance });
         emitAttendanceRealtimeUpdate(req, {
             type: 'DAY_STATUS_UPDATE',
@@ -2432,40 +3785,52 @@ router.post('/admin-upload', uploadAttendance, async (req, res) => {
             message: `Day status updated to ${dayState?.dayStatus || 'pending'}`
         });
 
+        await invalidateTrainerScheduleCaches([
+            attendance?.trainerId,
+            trainerId,
+        ]);
+
         res.json({
             success: true,
-            message: attendance?.driveAssets?.lastSyncError
-                ? 'Attendance saved, but Drive sync failed'
+            message: driveSyncQueued
+                ? 'Attendance uploaded successfully. Drive sync queued.'
                 : 'Attendance uploaded successfully',
             driveSync: {
-                synced: !attendance?.driveAssets?.lastSyncError,
-                error: attendance?.driveAssets?.lastSyncError || null
+                queued: driveSyncQueued,
+                synced: false,
+                error: null
             },
             data: attendance
         });
 
     } catch (error) {
-        console.error('Error uploading attendance:', error);
+        logAttendanceAsyncTelemetry('error', {
+            correlationId: adminUploadCorrelationId,
+            stage: 'admin_upload_failed',
+            status: 'admin_upload',
+            outcome: 'failed',
+            reason: error?.message || 'Unknown error',
+            contextLabel: adminUploadStage,
+        });
         res.status(500).json({ success: false, message: 'Failed to upload attendance', error: error.message });
     }
 });
 
 // SPOC Admin verifies attendance (Approve/Reject)
 router.put('/:id/verify', async (req, res) => {
+    let verifyStage = 'initializing request';
+    const verifyCorrelationId = createCorrelationId('attendance_verify_checkin');
     try {
-        let { status, comment } = req.body;
+        verifyStage = 'reading request payload';
+        const { status: requestedStatus, comment } = req.body;
         const attendanceId = req.params.id;
-
-        // Normalize status - trim whitespace and convert to lowercase
-        if (status) {
-            status = status.toString().trim().toLowerCase();
-        }
+        const status = normalizeVerificationStatus(requestedStatus, null);
 
         // Validate status
         if (!status || !['approved', 'rejected', 'pending'].includes(status)) {
             return res.status(400).json({
                 success: false,
-                message: `Invalid status. Must be "approved", "rejected", or "pending". Received: "${status}"`,
+                message: `Invalid status. Must be "approved", "rejected", or "pending". Received: "${requestedStatus}"`,
             });
         }
 
@@ -2480,7 +3845,39 @@ router.put('/:id/verify', async (req, res) => {
         // If Check-In is rejected, automatically reject Check-Out too
         if (status === 'rejected') {
             updateData.geoVerificationStatus = 'rejected';
+            updateData.geoValidationComment = null;
             updateData.status = 'Absent';
+            updateData.checkOutTime = null;
+            updateData.checkOutGeoImageUrl = null;
+            updateData.checkOutGeoImageUrls = [];
+            updateData.activityPhotos = [];
+            updateData.activityVideos = [];
+            updateData.images = [];
+            updateData.finalStatus = 'PENDING';
+            updateData.checkOutCapturedAt = null;
+            updateData.checkOutLatitude = null;
+            updateData.checkOutLongitude = null;
+            updateData.checkOutGeoDistanceMeters = null;
+            updateData.checkOutVerificationStatus = normalizeCheckOutVerificationStatus('pending_checkout');
+            updateData.checkOutVerificationMode = 'AUTO';
+            updateData.checkOutVerificationReason = null;
+            updateData.checkOutVerifiedAt = null;
+            updateData.checkOutVerifiedBy = null;
+            updateData.driveSyncStatus = 'PENDING';
+            updateData.checkOut = {
+                time: null,
+                finalStatus: 'PENDING',
+                location: {
+                    lat: null,
+                    lng: null,
+                    accuracy: null,
+                    address: null,
+                    distanceFromCollege: null
+                },
+                images: [],
+                photos: []
+            };
+            updateData.completedAt = null;
         }
 
         // If Check-In is approved, mark as Present
@@ -2502,7 +3899,12 @@ router.put('/:id/verify', async (req, res) => {
         }
 
         // Ensure verified check-in/check-out documents are synced to Drive hierarchy.
-        await syncStoredAttendanceFilesToDrive(attendance, `verify-check-in-${status}`);
+        verifyStage = 'syncing drive evidence';
+        await syncStoredAttendanceFilesToDrive(attendance, `verify-check-in-${status}`, {
+            correlationId: verifyCorrelationId,
+            attempt: 1,
+        });
+        verifyStage = 'updating schedule documents verification';
         await updateScheduleDocumentsVerificationStatus({
             attendance,
             fileType: 'attendance',
@@ -2522,6 +3924,7 @@ router.put('/:id/verify', async (req, res) => {
 
         // Notify Trainer on rejection
         if (status === 'rejected') {
+            verifyStage = 'dispatching rejection notifications';
             try {
                 const populatedAttendance = await Attendance.findById(attendanceId)
                     .populate({
@@ -2540,11 +3943,62 @@ router.put('/:id/verify', async (req, res) => {
                     });
                 }
             } catch (notifyError) {
-                console.error('Error sending rejection notification:', notifyError);
+                logAttendanceAsyncTelemetry('warn', {
+                    correlationId: verifyCorrelationId,
+                    stage: 'verify_checkin_rejection_notification_failed',
+                    trainerId: attendance?.trainerId ? String(attendance.trainerId) : null,
+                    attendanceId: attendance?._id ? String(attendance._id) : null,
+                    scheduleId: attendance?.scheduleId ? String(attendance.scheduleId) : null,
+                    status: 'verification_notification',
+                    outcome: 'failed',
+                    reason: notifyError.message,
+                    contextLabel: verifyStage,
+                });
+            }
+        }
+
+        if (status === 'approved') {
+            verifyStage = 'dispatching approval notifications';
+            try {
+                const populatedAttendance = await Attendance.findById(attendanceId)
+                    .populate({
+                        path: 'trainerId',
+                        populate: { path: 'userId', select: 'name' }
+                    })
+                    .populate('collegeId', 'name');
+
+                const trainerName = populatedAttendance?.trainerId?.userId?.name || 'Trainer';
+                const collegeName = populatedAttendance?.collegeId?.name || 'College';
+                const io = req.app.get('io');
+                const superAdmins = await User.find({ role: 'SuperAdmin' }).select('_id role');
+
+                superAdmins.forEach((admin) => {
+                    sendNotification(io, {
+                        userId: admin._id,
+                        role: admin.role,
+                        title: 'Trainer Marked Present',
+                        message: `${trainerName} was approved for today at ${collegeName}.`,
+                        type: 'Attendance',
+                        link: '/dashboard/trainer-activity'
+                    });
+                });
+            } catch (notifyError) {
+                logAttendanceAsyncTelemetry('warn', {
+                    correlationId: verifyCorrelationId,
+                    stage: 'verify_checkin_approval_notification_failed',
+                    trainerId: attendance?.trainerId ? String(attendance.trainerId) : null,
+                    attendanceId: attendance?._id ? String(attendance._id) : null,
+                    scheduleId: attendance?.scheduleId ? String(attendance.scheduleId) : null,
+                    status: 'verification_notification',
+                    outcome: 'failed',
+                    reason: notifyError.message,
+                    contextLabel: verifyStage,
+                });
             }
         }
 
         if (attendance.scheduleId) {
+            verifyStage = 'syncing schedule lifecycle status';
             await syncScheduleLifecycleStatusFromAttendance({
                 scheduleId: attendance.scheduleId,
                 attendance
@@ -2555,6 +4009,7 @@ router.put('/:id/verify', async (req, res) => {
         if (status === 'approved'
             && attendance.scheduleId
             && normalizeVerificationStatus(attendance?.geoVerificationStatus, '') === 'approved') {
+            verifyStage = 'dispatching completion notifications';
             try {
                 // Send Bell Notification to Trainer
                 const populatedAttendance = await Attendance.findById(attendanceId)
@@ -2576,7 +4031,17 @@ router.put('/:id/verify', async (req, res) => {
                     });
                 }
             } catch (syncError) {
-                console.error('Error syncing schedule status or sending notification:', syncError);
+                logAttendanceAsyncTelemetry('warn', {
+                    correlationId: verifyCorrelationId,
+                    stage: 'verify_checkin_completion_notification_failed',
+                    trainerId: attendance?.trainerId ? String(attendance.trainerId) : null,
+                    attendanceId: attendance?._id ? String(attendance._id) : null,
+                    scheduleId: attendance?.scheduleId ? String(attendance.scheduleId) : null,
+                    status: 'verification_notification',
+                    outcome: 'failed',
+                    reason: syncError.message,
+                    contextLabel: verifyStage,
+                });
             }
         }
 
@@ -2596,6 +4061,8 @@ router.put('/:id/verify', async (req, res) => {
             message: `Attendance verification status updated to ${attendance.verificationStatus}`
         });
 
+        await invalidateTrainerScheduleCaches([attendance?.trainerId]);
+
         const allocatedDrivePath = await buildAllocatedDrivePathForSchedule(attendance.scheduleId);
 
         res.json({
@@ -2609,7 +4076,14 @@ router.put('/:id/verify', async (req, res) => {
             allocatedDrivePath
         });
     } catch (error) {
-        console.error('Error verifying attendance:', error);
+        logAttendanceAsyncTelemetry('error', {
+            correlationId: verifyCorrelationId,
+            stage: 'verify_checkin_failed',
+            status: 'verification',
+            outcome: 'failed',
+            reason: error?.message || 'Unknown error',
+            contextLabel: verifyStage,
+        });
         res.status(500).json({
             success: false,
             message: 'Failed to verify attendance',
@@ -2619,428 +4093,183 @@ router.put('/:id/verify', async (req, res) => {
 });
 
 // Verify Geo Tag (SPOC Admin)
-router.put('/:id/verify-geo', async (req, res) => {
+router.post('/verify-geo', async (req, res) => {
     try {
-        const autoValidatedAttendance = await Attendance.findById(req.params.id)
-            .select('geoVerificationStatus geoValidationComment status completedAt scheduleId');
-
-        if (!autoValidatedAttendance) {
-            return res.status(404).json({
-                success: false,
-                message: 'Attendance record not found'
-            });
-        }
-
-        return res.status(410).json({
-            success: false,
-            message: 'Manual check-out approval is no longer available. Check-out status is auto-validated by date and location rules.',
-            data: {
-                attendanceId: autoValidatedAttendance._id,
-                geoVerificationStatus: autoValidatedAttendance.geoVerificationStatus,
-                geoValidationComment: autoValidatedAttendance.geoValidationComment || null,
-                status: autoValidatedAttendance.status,
-                completedAt: autoValidatedAttendance.completedAt || null,
-                scheduleId: autoValidatedAttendance.scheduleId || null
-            }
+        // Adapt legacy body if needed, though modular controller handles standard payload
+        req.body.attendanceId = req.body.attendanceId || req.body.id;
+        return await verifyGeoTagController(req, res);
+    } catch (err) {
+        logAttendanceAsyncTelemetry('error', {
+            correlationId: createCorrelationId('attendance_verify_geo_adapter'),
+            stage: 'legacy_verify_geo_adapter_failed',
+            status: 'geo_verification_adapter',
+            outcome: 'failed',
+            reason: err?.message || 'Unknown error',
+            contextLabel: 'verify_geo_adapter',
         });
-
-        const { status, comment } = req.body;
-        const attendanceId = req.params.id;
-
-        if (!['approved', 'rejected'].includes(status)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid status. Must be approved or rejected'
-            });
-        }
-
-        // CRITICAL: Check if check-in is approved before allowing check-out approval
-        if (status === 'approved') {
-            const attendance = await Attendance.findById(attendanceId);
-            if (!attendance) {
-                return res.status(404).json({
-                    success: false,
-                    message: 'Attendance record not found'
-                });
-            }
-
-            if (attendance.verificationStatus !== 'approved') {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Cannot approve check-out: Check-in must be approved first. Current check-in status: ' + (attendance.verificationStatus || 'pending')
-                });
-            }
-        }
-
-        // Determine attendance status based on verification
-        let attendanceStatus = undefined;
-        if (status === 'approved') {
-            attendanceStatus = 'Present';
-        } else if (status === 'rejected') {
-            attendanceStatus = 'Absent';
-        }
-
-        const updateData = {
-            geoVerificationStatus: status,
-            verificationComment: comment || '',
-            approvedBy: req.body.approvedBy || null,
-            verifiedAt: new Date()
-        };
-
-        if (attendanceStatus) {
-            updateData.status = attendanceStatus;
-        }
-
-        const attendance = await Attendance.findByIdAndUpdate(
-            attendanceId,
-            updateData,
-            { new: true, runValidators: true }
-        );
-
-        if (!attendance) {
-            return res.status(404).json({
-                success: false,
-                message: 'Attendance record not found'
-            });
-        }
-
-        // Ensure verified geo-tag evidence is synced to Drive hierarchy.
-        await syncStoredAttendanceFilesToDrive(attendance, `verify-geo-${status}`);
-        await updateScheduleDocumentsVerificationStatus({
-            attendance,
-            fileType: 'geotag',
-            verificationStatus: status,
-            verifiedBy: req.body.approvedBy || req.user?.id || null,
-            rejectReason: status === 'rejected' ? comment : null
-        });
-
-        // Notify Trainer on rejection
-        if (status === 'rejected') {
-            try {
-                const populatedAttendance = await Attendance.findById(attendanceId)
-                    .populate({
-                        path: 'trainerId',
-                        populate: { path: 'userId' }
-                    })
-                    .populate('collegeId');
-
-                if (populatedAttendance && populatedAttendance.trainerId?.userId) {
-                    await Notification.create({
-                        userId: populatedAttendance.trainerId.userId._id,
-                        title: 'Geo-Tag Rejected',
-                        message: `Your Check-Out / Geo-Tag for Day ${populatedAttendance.dayNumber || 'N/A'} at ${populatedAttendance.collegeId?.name || 'College'} was rejected. Reason: ${comment || 'No reason provided'}`,
-                        type: 'error',
-                        link: '/trainer/schedule'
-                    });
-                }
-            } catch (notifyError) {
-                console.error('Error sending geo-tag rejection notification:', notifyError);
-            }
-        }
-
-        if (attendance.scheduleId) {
-            await syncScheduleLifecycleStatusFromAttendance({
-                scheduleId: attendance.scheduleId,
-                attendance
-            });
-        }
-
-        // Update Schedule status to 'COMPLETED' when check-out is approved
-        if (status === 'approved' && attendance.scheduleId) {
-            try {
-                // Set completedAt timestamp and status
-                attendance.completedAt = new Date();
-                attendance.attendanceStatus = 'PRESENT'; // New Field
-                await attendance.save();
-
-                // Load schedule after lifecycle sync for downstream notifications.
-                const schedule = await Schedule.findById(attendance.scheduleId)
-                    .populate('courseId collegeId');
-
-                // Send Bell Notification to Trainer
-                try {
-                    const populatedAttendance = await Attendance.findById(attendanceId)
-                        .populate({
-                            path: 'trainerId',
-                            populate: { path: 'userId' }
-                        })
-                        .populate('collegeId')
-                        .populate('courseId')
-                        .populate({
-                            path: 'scheduleId',
-                            populate: { path: 'courseId' }
-                        });
-
-                    if (populatedAttendance && populatedAttendance.trainerId?.userId) {
-                        const courseName = populatedAttendance.courseId?.name || populatedAttendance.courseId?.title || populatedAttendance.scheduleId?.courseId?.name || populatedAttendance.scheduleId?.courseId?.title || 'N/A';
-                         const dayVal = `Day ${populatedAttendance.dayNumber || 'N/A'}`;
-
-                        await Notification.create({
-                            userId: populatedAttendance.trainerId.userId._id,
-                            title: '✅ Training Day Completed',
-                            message: `
-Course: ${courseName}
-College: ${populatedAttendance.collegeId?.name || 'N/A'}
-Day: ${dayVal}
-Date: ${new Date(populatedAttendance.date).toLocaleDateString()}
-Status: Completed
-`,
-                            type: 'success',
-                            link: '/trainer/schedule'
-                        });
-
-                        // Send Email Notification using Helper
-                        await sendTrainingCompletionEmail(
-                            populatedAttendance.trainerId.userId.email, 
-                            populatedAttendance.trainerId.userId.name,
-                            {
-                                course: courseName,
-                                college: populatedAttendance.collegeId?.name || 'N/A',
-                                day: dayVal,
-                                date: new Date(populatedAttendance.date).toLocaleDateString(),
-                                status: 'COMPLETED',
-                                portalUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/trainer/schedule`
-                            }
-                        );
-                    }
-                } catch (notifyError) {
-                    console.error('Error sending completion notification:', notifyError);
-                }
-            } catch (scheduleError) {
-                console.error('Error updating schedule status:', scheduleError);
-            }
-        }
-
-        const dayState = attendance.scheduleId
-            ? await syncScheduleDayState({ scheduleId: attendance.scheduleId, attendance })
-            : null;
-        emitAttendanceRealtimeUpdate(req, {
-            type: 'GEO_VERIFICATION_UPDATE',
-            attendanceId: attendance._id,
-            scheduleId: attendance.scheduleId || null,
-            status: attendance.geoVerificationStatus,
-            dayStatus: dayState?.dayStatus || null,
-            attendanceUploaded: dayState?.attendanceUploaded ?? null,
-            geoTagUploaded: dayState?.geoTagUploaded ?? null,
-            message: `Geo Tag verification status updated to ${attendance.geoVerificationStatus}`
-        });
-
-        res.json({
-            success: true,
-            message: 'Geo Tag verification status updated',
-            data: attendance
-        });
-    } catch (error) {
-        console.error('Error verifying geo tag:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to verify geo tag',
-            error: error.message
-        });
+        return res.status(500).json({ success: false, message: 'Failed to verify geo tag' });
     }
 });
 
-// Submit Attendance (Trainer) - Replaces check-in/check-out flow for Student System
+// Reject Geo Tag (SPOC Admin)
+router.post('/reject-geo', async (req, res) => {
+    try {
+        req.body.attendanceId = req.body.attendanceId || req.body.id;
+        return await rejectGeoTagController(req, res);
+    } catch (err) {
+        logAttendanceAsyncTelemetry('error', {
+            correlationId: createCorrelationId('attendance_reject_geo_adapter'),
+            stage: 'legacy_reject_geo_adapter_failed',
+            status: 'geo_verification_adapter',
+            outcome: 'failed',
+            reason: err?.message || 'Unknown error',
+            contextLabel: 'reject_geo_adapter',
+        });
+        return res.status(500).json({ success: false, message: 'Failed to reject geo tag' });
+    }
+});
+
+const runCanonicalAttendanceAdapterStep = async ({ handler, req, body }) => {
+    const originalBody = req.body;
+    const capture = {
+        statusCode: 200,
+        payload: null,
+    };
+
+    const adapterResponse = {
+        status(code) {
+            capture.statusCode = code;
+            return this;
+        },
+        json(payload) {
+            capture.payload = payload;
+            return payload;
+        },
+        set() {
+            return this;
+        },
+        get() {
+            return undefined;
+        },
+    };
+
+    try {
+        req.body = body;
+        await handler(req, adapterResponse);
+    } finally {
+        req.body = originalBody;
+    }
+
+    if (!capture.payload) {
+        capture.statusCode = capture.statusCode >= 400 ? capture.statusCode : 500;
+        capture.payload = {
+            success: false,
+            message: 'Canonical attendance flow returned no payload.',
+        };
+    }
+
+    return capture;
+};
+
+const buildLegacySubmitCheckInBody = (legacyBody = {}) => {
+    const checkInLocation = legacyBody.checkInLocation ?? legacyBody.location ?? null;
+    return {
+        ...legacyBody,
+        checkInLocation,
+        checkInTime:
+            legacyBody.checkInTime
+            || legacyBody.locationCapturedAt
+            || legacyBody.checkOutTime
+            || undefined,
+    };
+};
+
+const buildLegacySubmitCheckOutBody = (legacyBody = {}) => {
+    const checkOutLocation =
+        legacyBody.checkOutLocation
+        ?? legacyBody.location
+        ?? legacyBody.checkInLocation
+        ?? null;
+
+    return {
+        ...legacyBody,
+        checkOutLocation,
+        checkOutTime:
+            legacyBody.checkOutTime
+            || legacyBody.locationCapturedAt
+            || legacyBody.checkInTime
+            || undefined,
+    };
+};
+
+const hasLegacySubmitGeoEvidence = (files = {}) => {
+    const photoCount = [
+        ...(files?.photo || []),
+        ...(files?.checkOutGeoImage || []),
+    ].length;
+
+    return photoCount === 3;
+};
+
+// Legacy adapter endpoint.
+// Canonical production flow is:
+// 1) /attendance/check-in
+// 2) /attendance/check-out
+// 3) /attendance/:id/verify
 router.post('/submit', uploadAttendance, async (req, res) => {
     try {
-        const { 
-            scheduleId, trainerId, collegeId, dayNumber, 
-            studentsPresent, studentsAbsent, studentList,
-            latitude, longitude, locationCapturedAt
-        } = req.body;
+        res.set('X-MBK-Legacy-Endpoint', '/attendance/submit');
+        res.set('X-MBK-Canonical-Flow', '/attendance/check-in,/attendance/check-out,/attendance/:id/verify');
 
-        if (!scheduleId || !trainerId || !collegeId) {
-            return res.status(400).json({ success: false, message: 'Missing required fields' });
-        }
-
-        const schedule = await Schedule.findById(scheduleId).select('trainerId collegeId collegeLocation dayFolderId dayFolderName dayFolderLink attendanceFolderId attendanceFolderName attendanceFolderLink geoTagFolderId geoTagFolderName geoTagFolderLink driveFolderId driveFolderName driveFolderLink departmentId dayNumber');
-        if (!schedule) {
-            return res.status(404).json({ success: false, message: 'Invalid scheduleId' });
-        }
-
-        const uploadAccessError = validateAssignedScheduleUpload({
-            schedule,
-            trainerId,
-            collegeId,
-            dayNumber
+        const legacyPayload = { ...(req.body || {}) };
+        const checkInResult = await runCanonicalAttendanceAdapterStep({
+            handler: checkInHandler,
+            req,
+            body: buildLegacySubmitCheckInBody(legacyPayload),
         });
-        if (uploadAccessError) {
-            return res.status(uploadAccessError.status).json({
-                success: false,
-                message: uploadAccessError.message
+
+        if (checkInResult.statusCode >= 400 || !checkInResult.payload?.success) {
+            return res.status(checkInResult.statusCode).json(checkInResult.payload);
+        }
+
+        if (!hasLegacySubmitGeoEvidence(req.files)) {
+            return res.status(200).json({
+                ...checkInResult.payload,
+                message: 'Legacy submit adapter completed canonical check-in. Complete canonical check-out using /attendance/check-out with 3 GeoTag images.',
+                adapter: {
+                    legacyEndpoint: '/attendance/submit',
+                    executedSteps: ['check-in'],
+                    pendingSteps: ['check-out', 'verification'],
+                },
             });
         }
 
-        let distance = null;
-        if (schedule.collegeLocation?.lat && schedule.collegeLocation?.lng && latitude && longitude) {
-            try {
-                distance = haversine(
-                    { latitude: parseFloat(latitude), longitude: parseFloat(longitude) },
-                    { latitude: schedule.collegeLocation.lat, longitude: schedule.collegeLocation.lng }
-                );
-            } catch (distanceError) {
-                console.error('[SUBMIT] Distance calculation failed (non-blocking):', distanceError);
-            }
-        }
-
-        // Parse student list
-        let students = [];
-        if (studentList) {
-            try {
-                students = JSON.parse(studentList);
-            } catch (e) {
-                console.error('Error parsing student list:', e);
-            }
-        }
-
-        // Handle files
-        let generatedAttendanceSheetFile = null;
-        const attendancePdfUrl = req.files?.attendancePdf ? req.files.attendancePdf[0].path : undefined;
-        const attendanceExcelUrl = req.files?.attendanceExcel ? req.files.attendanceExcel[0].path : undefined;
-        let studentsPhotoUrl = undefined;
-        if (req.files?.studentsPhoto) {
-            studentsPhotoUrl = req.files.studentsPhoto.map(f => f.path); // Store generic photos
-        }
-        
-        // Handle Signature
-        const signatureUrl = req.files?.signature ? req.files.signature[0].path : undefined;
-
-        // Activity evidence
-        let activityPhotos = [];
-        if (req.files?.activityPhotos) {
-            activityPhotos = req.files.activityPhotos.map(f => f.path);
-        }
-        let activityVideos = [];
-        if (req.files?.activityVideos) {
-            activityVideos = req.files.activityVideos.map(f => f.path);
-        }
-
-        // Find or Create Attendance
-        let attendance = await Attendance.findOne({ scheduleId });
-
-        if (!attendance) {
-            attendance = new Attendance({
-                scheduleId,
-                trainerId,
-                collegeId,
-                dayNumber,
-                date: new Date(),
-                uploadedBy: 'trainer'
-            });
-        }
-
-        // Update fields
-        const submitGeoInvalid = Number.isFinite(distance) && distance > ALLOWED_GEO_RANGE_METERS;
-        attendance.checkInTime = new Date().toTimeString().split(' ')[0];
-        attendance.checkOutTime = new Date().toTimeString().split(' ')[0]; // Auto checkout for this flow?
-        attendance.status = submitGeoInvalid ? 'Pending' : 'Present';
-        attendance.verificationStatus = 'pending';
-        attendance.geoVerificationStatus = submitGeoInvalid ? 'pending' : 'approved';
-        attendance.geoValidationComment = submitGeoInvalid
-            ? `Location mismatch: you are ${Math.round(distance)} meters away from the assigned college.`
-            : null;
-        attendance.studentsPresent = studentsPresent || 0;
-        attendance.studentsAbsent = studentsAbsent || 0;
-        attendance.students = students; // Save detailed list
-        
-        if (attendancePdfUrl) attendance.attendancePdfUrl = attendancePdfUrl;
-        if (attendanceExcelUrl) attendance.attendanceExcelUrl = attendanceExcelUrl;
-        if (signatureUrl) attendance.signatureUrl = signatureUrl;
-        if (latitude) attendance.latitude = latitude;
-        if (longitude) attendance.longitude = longitude;
-        if (locationCapturedAt) attendance.locationCapturedAt = locationCapturedAt;
-        
-        if (activityPhotos.length > 0) attendance.activityPhotos = activityPhotos;
-        if (activityVideos.length > 0) attendance.activityVideos = activityVideos;
-
-        // Generate Attendance Excel
-        if (students.length > 0) {
-            try {
-                // Create Workbook
-                const wb = xlsx.utils.book_new();
-                
-                // Format Data for Excel
-                const excelData = students.map(s => ({
-                    'Roll No': s.rollNo,
-                    'Register No': s.registerNo,
-                    'Student Name': s.name,
-                    'Status': s.status
-                }));
-
-                const ws = xlsx.utils.json_to_sheet(excelData);
-                xlsx.utils.book_append_sheet(wb, ws, "Attendance");
-
-                // Define Path
-                // Ensure directory exists
-                const uploadDir = path.join(__dirname, '../uploads/attendance-sheets');
-                if (!fs.existsSync(uploadDir)) {
-                    fs.mkdirSync(uploadDir, { recursive: true });
-                }
-
-                // Filename: College_DayX_Date.xlsx
-                const dateStr = new Date().toISOString().split('T')[0];
-                const fileName = `Attendance_${collegeId}_Day${dayNumber}_${dateStr}_${Date.now()}.xlsx`;
-                const filePath = path.join(uploadDir, fileName);
-
-                // Write File
-                xlsx.writeFile(wb, filePath);
-
-                // Save URL (relative path for serving)
-                // We'll need to serve specific route for this
-                attendance.attendanceExcelUrl = fileName; 
-                generatedAttendanceSheetFile = {
-                    path: filePath,
-                    originalname: fileName,
-                    mimetype: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                };
-
-            } catch (err) {
-                console.error('Error generating Excel:', err);
-            }
-        }
-
-        const driveSyncFilesByField = { ...(req.files || {}) };
-        if (generatedAttendanceSheetFile) {
-            driveSyncFilesByField.attendanceExcel = [generatedAttendanceSheetFile];
-        }
-
-        await syncAttendanceFilesToDrive({
-            attendance,
-            scheduleId,
-            schedule,
-            filesByField: driveSyncFilesByField,
-            contextLabel: 'submit'
-        });
-        await attendance.save();
-
-        // Update Schedule status
-        await Schedule.findByIdAndUpdate(scheduleId, { status: 'completed' });
-        const dayState = await syncScheduleDayState({ scheduleId, attendance });
-        emitAttendanceRealtimeUpdate(req, {
-            type: 'DAY_STATUS_UPDATE',
-            scheduleId,
-            attendanceId: attendance._id,
-            dayStatus: dayState?.dayStatus || null,
-            attendanceUploaded: dayState?.attendanceUploaded ?? null,
-            geoTagUploaded: dayState?.geoTagUploaded ?? null,
-            message: `Day status updated to ${dayState?.dayStatus || 'pending'}`
+        const checkOutResult = await runCanonicalAttendanceAdapterStep({
+            handler: checkOutHandler,
+            req,
+            body: buildLegacySubmitCheckOutBody(legacyPayload),
         });
 
-        res.json({
-            success: true,
-            message: attendance?.driveAssets?.lastSyncError
-                ? 'Attendance submitted, but Drive sync failed'
-                : 'Attendance submitted successfully',
-            driveSync: {
-                synced: !attendance?.driveAssets?.lastSyncError,
-                error: attendance?.driveAssets?.lastSyncError || null
+        if (checkOutResult.statusCode >= 400 || !checkOutResult.payload?.success) {
+            return res.status(checkOutResult.statusCode).json(checkOutResult.payload);
+        }
+
+        return res.status(checkOutResult.statusCode || 200).json({
+            ...checkOutResult.payload,
+            message: `Legacy submit adapter executed canonical check-in + check-out. ${checkOutResult.payload?.message || ''}`.trim(),
+            adapter: {
+                legacyEndpoint: '/attendance/submit',
+                executedSteps: ['check-in', 'check-out'],
+                pendingSteps: ['verification'],
             },
-            data: attendance
         });
-
     } catch (error) {
-        console.error('Error submitting attendance:', error);
-        res.status(500).json({ success: false, message: 'Failed to submit attendance', error: error.message });
+        console.error('Error submitting attendance through legacy adapter:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Failed to process legacy submit adapter',
+            error: error.message,
+        });
     }
 });
 
@@ -3139,8 +4368,11 @@ router.get('/:id/export-excel', async (req, res) => {
     }
 });
 
-router.uploadSingleGeoImageMiddleware = uploadManual;
+router.uploadSingleGeoImageMiddleware = uploadSingleGeoImageMiddleware;
 router.uploadSingleGeoImageHandler = uploadSingleGeoImageHandler;
 
+router.validateAssignedScheduleUpload = validateAssignedScheduleUpload;
+router.validateCheckOutSessionState = validateCheckOutSessionState;
+router.resolveCanonicalUploadFolders = resolveCanonicalUploadFolders;
 module.exports = router;
 

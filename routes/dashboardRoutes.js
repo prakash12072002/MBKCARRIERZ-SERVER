@@ -75,48 +75,57 @@ async function countDistinctColleges(match = {}) {
 // Super Admin Dashboard Stats
 router.get('/super-admin', authenticate, authorize('SuperAdmin'), async (req, res) => {
     try {
-        const totalCompanies = await Company.countDocuments();
-        const totalColleges = await countDistinctColleges();
-        const totalTrainers = await Trainer.countDocuments();
-        
         // Active Trainers Today (trainers with attendance marked today)
         const today = new Date();
         today.setHours(0, 0, 0, 0);
-        const activeTrainersToday = await Trainer.countDocuments({ 
-            lastActiveDate: { $gte: today } 
-        }) || 0;
-
-        // Present / Absent Count
-        const presentCount = await Attendance.countDocuments({ 
-            date: { $gte: today },
-            status: 'Present'
-        });
-        const absentCount = await Attendance.countDocuments({ 
-            date: { $gte: today },
-            status: 'Absent'
-        });
-
-        const pendingApprovals = await Trainer.countDocuments({ verificationStatus: 'pending' });
-        const salaryDue = 0;
 
         // Fetch Recent Trainer Activity (Last 10 activities from today and yesterday)
         const yesterday = new Date(today);
         yesterday.setDate(yesterday.getDate() - 1);
-        
-        const receNDAttendance = await Attendance.find({
-            createdAt: { $gte: yesterday }
-        })
-        .populate('trainerId', 'userId')
-        .populate({
-            path: 'trainerId',
-            populate: {
-                path: 'userId',
-                select: 'name'
-            }
-        })
-        .populate('collegeId', 'name')
-        .sort({ createdAt: -1 })
-        .limit(10);
+
+        const [
+            totalCompanies,
+            totalColleges,
+            totalTrainers,
+            activeTrainersToday,
+            presentCount,
+            absentCount,
+            pendingApprovals,
+            receNDAttendance,
+        ] = await Promise.all([
+            Company.countDocuments(),
+            countDistinctColleges(),
+            Trainer.countDocuments(),
+            Trainer.countDocuments({
+                lastActiveDate: { $gte: today }
+            }),
+            Attendance.countDocuments({
+                date: { $gte: today },
+                status: 'Present'
+            }),
+            Attendance.countDocuments({
+                date: { $gte: today },
+                status: 'Absent'
+            }),
+            Trainer.countDocuments({ verificationStatus: 'pending' }),
+            Attendance.find({
+                createdAt: { $gte: yesterday }
+            })
+                .populate('trainerId', 'userId')
+                .populate({
+                    path: 'trainerId',
+                    populate: {
+                        path: 'userId',
+                        select: 'name'
+                    }
+                })
+                .populate('collegeId', 'name')
+                .sort({ createdAt: -1 })
+                .limit(10)
+                .lean(),
+        ]);
+
+        const salaryDue = 0;
 
         const receNDActivity = receNDAttendance.map(att => {
             const trainerName = att.trainerId?.userId?.name || 'Unknown Trainer';
@@ -192,39 +201,43 @@ router.get('/spoc', authenticate, authorize('SPOCAdmin', 'CollegeAdmin'), async 
             });
         }
 
-        const colleges = await College.find({ companyId: company._id }).select('_id');
+        const [colleges, distinctCollegeCount] = await Promise.all([
+            College.find({ companyId: company._id }).select('_id').lean(),
+            countDistinctColleges({ companyId: company._id }),
+        ]);
         const collegeIds = colleges.map(c => c._id);
-        const distinctCollegeCount = await countDistinctColleges({ companyId: company._id });
 
         const today = new Date();
         today.setHours(0, 0, 0, 0);
         const tomorrow = new Date(today);
         tomorrow.setDate(tomorrow.getDate() + 1);
 
-        // Today's Trainers (Scheduled)
-        const todayTrainersCount = await Schedule.countDocuments({
-            collegeId: { $in: collegeIds },
-            scheduledDate: { $gte: today, $lt: tomorrow },
-            status: { $ne: 'cancelled' }
-        });
-
-        // Pending Verifications (Attendance)
-        const pendingVerifications = await Attendance.countDocuments({
-            collegeId: { $in: collegeIds },
-            verificationStatus: 'pending'
-        });
-
-        // Attendance Summary (Today's Present/Absent)
-        const presentToday = await Attendance.countDocuments({
-            collegeId: { $in: collegeIds },
-            date: { $gte: today, $lt: tomorrow },
-            status: 'Present'
-        });
-        const absentToday = await Attendance.countDocuments({
-            collegeId: { $in: collegeIds },
-            date: { $gte: today, $lt: tomorrow },
-            status: 'Absent'
-        });
+        const [
+            todayTrainersCount,
+            pendingVerifications,
+            presentToday,
+            absentToday,
+        ] = await Promise.all([
+            Schedule.countDocuments({
+                collegeId: { $in: collegeIds },
+                scheduledDate: { $gte: today, $lt: tomorrow },
+                status: { $ne: 'cancelled' }
+            }),
+            Attendance.countDocuments({
+                collegeId: { $in: collegeIds },
+                verificationStatus: 'pending'
+            }),
+            Attendance.countDocuments({
+                collegeId: { $in: collegeIds },
+                date: { $gte: today, $lt: tomorrow },
+                status: 'Present'
+            }),
+            Attendance.countDocuments({
+                collegeId: { $in: collegeIds },
+                date: { $gte: today, $lt: tomorrow },
+                status: 'Absent'
+            }),
+        ]);
 
         res.json({
             success: true,

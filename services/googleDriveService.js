@@ -295,6 +295,23 @@ const getFolderMetadata = async (drive, folderId) => {
         `Google Drive folder ${folderId} is not accessible. Confirm the folder ID is correct and share the folder with ${serviceAccountEmail || "the configured service account"} as Editor.`,
       );
     }
+    if (isDrivePermissionDeniedError(error)) {
+      const authContext = resolveDriveAuthContext();
+      throw new Error(
+        buildDrivePermissionDeniedMessage({
+          folderId,
+          authMode: authContext.authMode,
+          serviceAccountEmail:
+            authContext.authMode === "service_account"
+              ? authContext.credentials?.client_email
+              : "",
+          impersonatedUserEmail:
+            authContext.authMode === "service_account"
+              ? authContext.impersonatedUserEmail
+              : "",
+        }),
+      );
+    }
     throw error;
   }
 
@@ -317,12 +334,38 @@ const ensureDriveFolder = async ({
   }
 
   const drive = await getDriveClient();
-  const existingFolders = await listDriveFoldersByName({
-    drive,
-    folderName: safeFolderName,
-    parentFolderId,
-    pageSize: 25,
-  });
+  const authContext = resolveDriveAuthContext();
+  const serviceAccountEmail =
+    authContext.authMode === "service_account"
+      ? authContext.credentials?.client_email
+      : "";
+  const impersonatedUserEmail =
+    authContext.authMode === "service_account"
+      ? authContext.impersonatedUserEmail
+      : "";
+
+  let existingFolders = [];
+  try {
+    existingFolders = await listDriveFoldersByName({
+      drive,
+      folderName: safeFolderName,
+      parentFolderId,
+      pageSize: 25,
+    });
+  } catch (error) {
+    if (isDrivePermissionDeniedError(error)) {
+      throw new Error(
+        buildDrivePermissionDeniedMessage({
+          folderId: parentFolderId,
+          folderName: safeFolderName,
+          authMode: authContext.authMode,
+          serviceAccountEmail,
+          impersonatedUserEmail,
+        }),
+      );
+    }
+    throw error;
+  }
 
   if (existingFolders.length) {
     let folder = existingFolders[0];
@@ -333,21 +376,42 @@ const ensureDriveFolder = async ({
         folderName: safeFolderName,
         keepFolderId: folder.id,
       });
+      if (Array.isArray(cleanupResult?.cleanupWarnings) && cleanupResult.cleanupWarnings.length) {
+        cleanupResult.cleanupWarnings.forEach((warningMessage) => {
+          console.warn("[GOOGLE-DRIVE]", warningMessage);
+        });
+      }
       folder = cleanupResult.folder || folder;
     }
     ensuredFolderCache.set(cacheKey, folder);
     return folder;
   }
 
-  const createdFolder = await drive.files.create({
-    requestBody: {
-      name: safeFolderName,
-      mimeType: DRIVE_FOLDER_MIME_TYPE,
-      parents: [parentFolderId],
-    },
-    fields: "id,name,webViewLink,driveId",
-    supportsAllDrives: true,
-  });
+  let createdFolder;
+  try {
+    createdFolder = await drive.files.create({
+      requestBody: {
+        name: safeFolderName,
+        mimeType: DRIVE_FOLDER_MIME_TYPE,
+        parents: [parentFolderId],
+      },
+      fields: "id,name,webViewLink,driveId",
+      supportsAllDrives: true,
+    });
+  } catch (error) {
+    if (isDrivePermissionDeniedError(error)) {
+      throw new Error(
+        buildDrivePermissionDeniedMessage({
+          folderId: parentFolderId,
+          folderName: safeFolderName,
+          authMode: authContext.authMode,
+          serviceAccountEmail,
+          impersonatedUserEmail,
+        }),
+      );
+    }
+    throw error;
+  }
 
   ensuredFolderCache.set(cacheKey, createdFolder.data);
   return createdFolder.data;
@@ -379,12 +443,32 @@ const listDriveFoldersByName = async ({
   ].join(" and ");
 
   const response = await driveClient.files.list({
-    q: query,
-    fields: "files(id,name,webViewLink,driveId,parents,createdTime)",
-    pageSize,
-    includeItemsFromAllDrives: true,
-    supportsAllDrives: true,
-  });
+      q: query,
+      fields: "files(id,name,webViewLink,driveId,parents,createdTime)",
+      pageSize,
+      includeItemsFromAllDrives: true,
+      supportsAllDrives: true,
+    }).catch((error) => {
+      if (isDrivePermissionDeniedError(error)) {
+        const authContext = resolveDriveAuthContext();
+        throw new Error(
+          buildDrivePermissionDeniedMessage({
+            folderId: parentFolderId,
+            folderName: safeFolderName,
+            authMode: authContext.authMode,
+            serviceAccountEmail:
+              authContext.authMode === "service_account"
+                ? authContext.credentials?.client_email
+                : "",
+            impersonatedUserEmail:
+              authContext.authMode === "service_account"
+                ? authContext.impersonatedUserEmail
+                : "",
+          }),
+        );
+      }
+      throw error;
+    });
 
   return Array.isArray(response.data.files) ? response.data.files : [];
 };
@@ -416,7 +500,8 @@ const listDriveFolderChildren = async ({ drive, folderId }) => {
   do {
     const response = await driveClient.files.list({
       q: [`'${folderId}' in parents`, "trashed = false"].join(" and "),
-      fields: "nextPageToken,files(id,name,mimeType,parents,webViewLink,driveId)",
+      fields:
+        "nextPageToken,files(id,name,mimeType,parents,webViewLink,driveId,createdTime,modifiedTime)",
       pageSize: 100,
       pageToken,
       includeItemsFromAllDrives: true,
@@ -461,32 +546,64 @@ const mergeDuplicateDriveFolders = async ({
   const duplicates = matches.filter((item) => item?.id && item.id !== keepFolder.id);
   const movedItems = [];
   const removedFolderIds = [];
+  const cleanupWarnings = [];
 
   for (const duplicate of duplicates) {
-    const children = await listDriveFolderChildren({
-      drive: driveClient,
-      folderId: duplicate.id,
-    });
+    let children = [];
+    try {
+      children = await listDriveFolderChildren({
+        drive: driveClient,
+        folderId: duplicate.id,
+      });
+    } catch (error) {
+      if (isDrivePermissionDeniedError(error)) {
+        cleanupWarnings.push(
+          `Skipping duplicate folder cleanup for "${duplicate.name || folderName}" because the Drive account cannot inspect folder ${duplicate.id}.`,
+        );
+        continue;
+      }
+      throw error;
+    }
 
     for (const child of children) {
       if (!child?.id) continue;
-      await moveDriveItemToParent({
-        itemId: child.id,
-        targetParentId: keepFolder.id,
-      });
-      movedItems.push({
-        itemId: child.id,
-        itemName: child.name || null,
-        fromFolderId: duplicate.id,
-        toFolderId: keepFolder.id,
-      });
+      try {
+        await moveDriveItemToParent({
+          itemId: child.id,
+          targetParentId: keepFolder.id,
+        });
+        movedItems.push({
+          itemId: child.id,
+          itemName: child.name || null,
+          fromFolderId: duplicate.id,
+          toFolderId: keepFolder.id,
+        });
+      } catch (error) {
+        if (isDrivePermissionDeniedError(error)) {
+          cleanupWarnings.push(
+            `Skipping move for Drive item ${child.id} from duplicate folder ${duplicate.id} because the Drive account lacks permission.`,
+          );
+          continue;
+        }
+        throw error;
+      }
     }
 
-    await driveClient.files.delete({
-      fileId: duplicate.id,
-      supportsAllDrives: true,
-    });
-    removedFolderIds.push(duplicate.id);
+    try {
+      await driveClient.files.delete({
+        fileId: duplicate.id,
+        supportsAllDrives: true,
+      });
+      removedFolderIds.push(duplicate.id);
+    } catch (error) {
+      if (isDrivePermissionDeniedError(error)) {
+        cleanupWarnings.push(
+          `Duplicate Drive folder ${duplicate.id} could not be deleted because the Drive account lacks permission. Keeping existing folder ${keepFolder.id} for sync.`,
+        );
+        continue;
+      }
+      throw error;
+    }
   }
 
   if (duplicates.length) {
@@ -497,6 +614,7 @@ const mergeDuplicateDriveFolders = async ({
     folder: keepFolder,
     removedFolderIds,
     movedItems,
+    cleanupWarnings,
   };
 };
 
@@ -633,6 +751,38 @@ const isStorageQuotaExceededError = (error) =>
   Array.isArray(error?.errors) &&
   error.errors.some((item) => item?.reason === "storageQuotaExceeded");
 
+const getDriveErrorReasons = (error) => {
+  const directReasons = Array.isArray(error?.errors)
+    ? error.errors.map((item) => String(item?.reason || "").trim()).filter(Boolean)
+    : [];
+  const nestedReasons = Array.isArray(error?.response?.data?.error?.errors)
+    ? error.response.data.error.errors
+        .map((item) => String(item?.reason || "").trim())
+        .filter(Boolean)
+    : [];
+
+  return [...directReasons, ...nestedReasons];
+};
+
+const isDrivePermissionDeniedError = (error) => {
+  const reasons = getDriveErrorReasons(error);
+  const message = String(error?.message || "").toLowerCase();
+
+  return (
+    error?.code === 403 &&
+    (
+      reasons.some((reason) =>
+        ["insufficientfilepermissions", "insufficientpermissions", "forbidden"].includes(
+          reason.toLowerCase(),
+        ),
+      ) ||
+      message.includes("sufficient permissions") ||
+      message.includes("insufficient permissions") ||
+      message.includes("permission")
+    )
+  );
+};
+
 const buildDriveQuotaErrorMessage = ({
   folderId,
   folderName,
@@ -656,6 +806,26 @@ const buildDriveQuotaErrorMessage = ({
   }
 
   return `Google Drive upload failed because the service account ${serviceAccountEmail} does not have usable storage for folder "${folderLabel}". Confirm the folder is inside a Shared Drive and that the service account has upload access there.`;
+};
+
+const buildDrivePermissionDeniedMessage = ({
+  folderId,
+  folderName,
+  authMode,
+  serviceAccountEmail,
+  impersonatedUserEmail,
+}) => {
+  const folderLabel = folderName || folderId || "configured Drive folder";
+
+  if (authMode === "oauth2") {
+    return `Google Drive permission issue: the Google account connected by GOOGLE_DRIVE_REFRESH_TOKEN cannot access or edit folder "${folderLabel}". Share that folder or its parent with the same Google account as Editor, or reconnect using a Google account that already has access.`;
+  }
+
+  if (impersonatedUserEmail) {
+    return `Google Drive permission issue: delegated user ${impersonatedUserEmail} cannot access or edit folder "${folderLabel}". Share that folder with ${impersonatedUserEmail}, or confirm domain-wide delegation and Drive scope are enabled for ${serviceAccountEmail}.`;
+  }
+
+  return `Google Drive permission issue: service account ${serviceAccountEmail || "the configured service account"} cannot access or edit folder "${folderLabel}". Share that folder with the service account as Editor, or move the hierarchy into a Shared Drive where it has access.`;
 };
 
 const buildDriveUrls = (fileId) => ({
@@ -778,6 +948,8 @@ const uploadToDrive = async ({
   originalName,
   folderId = DEFAULT_TRAINER_DOCUMENTS_FOLDER_ID,
   fileName,
+  replaceExistingFile = true,
+  cleanupDuplicateFiles = true,
 }) => {
   if (!folderId) {
     throw new Error("Google Drive folder ID is required.");
@@ -810,12 +982,15 @@ const uploadToDrive = async ({
 
   let fileResponse;
   try {
-    const existingMatches = await findDriveFilesByName({
-      drive,
-      folderId,
-      fileName: driveFileName,
-    });
-    const existingFile = Array.isArray(existingMatches)
+    const existingMatches =
+      replaceExistingFile && fileName
+        ? await findDriveFilesByName({
+            drive,
+            folderId,
+            fileName: driveFileName,
+          })
+        : [];
+    const existingFile = replaceExistingFile && Array.isArray(existingMatches)
       ? existingMatches[0] || null
       : null;
 
@@ -863,6 +1038,18 @@ const uploadToDrive = async ({
       );
     }
 
+    if (isDrivePermissionDeniedError(error)) {
+      throw new Error(
+        buildDrivePermissionDeniedMessage({
+          folderId,
+          folderName: folderMetadata?.name,
+          authMode: authContext.authMode,
+          serviceAccountEmail: credentials?.client_email,
+          impersonatedUserEmail,
+        }),
+      );
+    }
+
     throw error;
   }
 
@@ -872,7 +1059,7 @@ const uploadToDrive = async ({
     `[GOOGLE-DRIVE] Uploaded "${driveFileName}" as file ${fileId} into folder ${folderId}`,
   );
 
-  if (fileName) {
+  if (fileName && cleanupDuplicateFiles) {
     await cleanupDuplicateDriveFiles({
       drive,
       folderId,

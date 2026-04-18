@@ -11,8 +11,19 @@ function signCaptcha(text, issuedAt) {
 }
 
 const verifyCaptcha = (req, res, next) => {
-  const userInput = (req.body.captcha || "").trim();
-  const captchaToken = (req.body.captchaToken || "").trim();
+  const captchaPayload = req.body?.captcha;
+  const userInput =
+    typeof captchaPayload === "string"
+      ? captchaPayload.trim()
+      : typeof captchaPayload?.value === "string"
+        ? captchaPayload.value.trim()
+        : "";
+  const captchaToken =
+    typeof req.body?.captchaToken === "string"
+      ? req.body.captchaToken.trim()
+      : typeof captchaPayload?.token === "string"
+        ? captchaPayload.token.trim()
+        : "";
 
   // Skip CAPTCHA verification on mobile (no token provided)
   // Mobile clients do not show CAPTCHA, so we skip this check.
@@ -47,16 +58,36 @@ const verifyCaptcha = (req, res, next) => {
     });
   }
 
-  // Verify HMAC signature for the user's input
+  // Verify HMAC signature for the user's input.
+  // Defensive checks prevent malformed token payloads from throwing uncaught 500s.
   const expectedSig = signCaptcha(userInput, issuedAt);
+  const hexRegex = /^[a-f0-9]+$/i;
+  if (!hexRegex.test(receivedSig) || !hexRegex.test(expectedSig)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid CAPTCHA token. Please refresh and try again.",
+    });
+  }
+
+  const receivedBuffer = Buffer.from(receivedSig, "hex");
+  const expectedBuffer = Buffer.from(expectedSig, "hex");
+  if (receivedBuffer.length !== expectedBuffer.length) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid CAPTCHA token. Please refresh and try again.",
+    });
+  }
 
   // Constant-time comparison to avoid timing attacks
-  const sigMatch =
-    receivedSig.length === expectedSig.length &&
-    crypto.timingSafeEqual(
-      Buffer.from(receivedSig, "hex"),
-      Buffer.from(expectedSig, "hex")
-    );
+  let sigMatch = false;
+  try {
+    sigMatch = crypto.timingSafeEqual(receivedBuffer, expectedBuffer);
+  } catch (error) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid CAPTCHA token. Please refresh and try again.",
+    });
+  }
 
   if (!sigMatch) {
     return res.status(400).json({

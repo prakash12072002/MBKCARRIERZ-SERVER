@@ -28,3 +28,5 @@ config/superadmin-*.json
 # Misc
 .DS_Store
 .vscode/
+
+config/mbk-tsmg-drive-31c901fee365.json

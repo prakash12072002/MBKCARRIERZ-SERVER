@@ -31,7 +31,36 @@ const {
 const {
   ensureCompanyHierarchy,
   isTrainingDriveEnabled,
-} = require("../services/googleDriveTrainingHierarchyService");
+} = require("../modules/drive/driveGateway");
+
+const createSystemGeneratedPassword = () =>
+  `MBK#${crypto.randomBytes(24).toString("hex")}`;
+
+let firebaseUidIndexEnsured = false;
+const ensureFirebaseUidIndexCompatibility = async () => {
+  if (firebaseUidIndexEnsured) return;
+  try {
+    const indexes = await User.collection.indexes();
+    const firebaseIndex = indexes.find((idx) => idx?.key?.firebaseUid === 1);
+
+    if (!firebaseIndex) {
+      await User.collection.createIndex(
+        { firebaseUid: 1 },
+        { name: "firebaseUid_1", unique: true, sparse: true },
+      );
+    } else if (firebaseIndex.unique && !firebaseIndex.sparse) {
+      // Repair legacy unique(non-sparse) index that rejects multiple null values.
+      await User.collection.dropIndex(firebaseIndex.name || "firebaseUid_1");
+      await User.collection.createIndex(
+        { firebaseUid: 1 },
+        { name: "firebaseUid_1", unique: true, sparse: true },
+      );
+    }
+    firebaseUidIndexEnsured = true;
+  } catch (indexError) {
+    console.error("[AUTH] firebaseUid index compatibility check failed:", indexError?.message || indexError);
+  }
+};
 
 const buildTrainerRegistrationState = async (trainer) => {
   if (!trainer?._id) {
@@ -59,12 +88,22 @@ const buildTrainerRegistrationState = async (trainer) => {
 
 // Helper to set refresh token cookie
 const setTokenCookie = (res, token) => {
+  const refreshTokenDays = Number(process.env.REFRESH_TOKEN_DAYS ?? 30);
+  const shouldPersistAcrossBrowserRestart =
+    Number.isFinite(refreshTokenDays) && refreshTokenDays > 0;
+
   const cookieOptions = {
     httpOnly: true,
-    expires: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
   };
+
+  if (shouldPersistAcrossBrowserRestart) {
+    cookieOptions.expires = new Date(
+      Date.now() + refreshTokenDays * 24 * 60 * 60 * 1000,
+    );
+  }
+
   res.cookie("refreshToken", token, cookieOptions);
 };
 
@@ -284,6 +323,7 @@ router.post("/verify-msg91-otp", async (req, res) => {
       user = await User.create({
         name: `User ${randomSuffix}`,
         email: `${mobile || "user" + randomSuffix}@mbkcarrierz.msg91`,
+        password: createSystemGeneratedPassword(),
         phone: mobile,
         phoneNumber: mobile,
         role: "Trainer",
@@ -304,6 +344,17 @@ router.post("/verify-msg91-otp", async (req, res) => {
       process.env.JWT_SECRET || "secret_key",
       { expiresIn: "24h" },
     );
+
+    // Keep OTP login consistent with password login:
+    // issue refresh token cookie so server-side route guards can trust it.
+    const refreshToken = crypto.randomBytes(40).toString("hex");
+    await RefreshToken.create({
+      user: user._id,
+      token: refreshToken,
+      expires: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+      createdByIp: req.ip,
+    });
+    setTokenCookie(res, refreshToken);
 
     res.json({
       success: true,
@@ -896,6 +947,7 @@ router.post(
  */
 router.post("/trainer-reg-init", async (req, res) => {
   try {
+    await ensureFirebaseUidIndexCompatibility();
     const { email } = req.body;
 
     if (!email) {
@@ -986,6 +1038,7 @@ router.post("/trainer-reg-init", async (req, res) => {
     } else {
       user = await User.create({
         email,
+        password: createSystemGeneratedPassword(),
         role: "Trainer",
         accountStatus: "pending",
         emailVerified: false,
@@ -1179,7 +1232,7 @@ router.post(
             title: "New Trainer Registration",
             message: `New trainer ${name} has signed up and is awaiting approval.`,
             type: "info",
-            link: "/admin/trainers",
+            link: "/dashboard/trainers",
           }));
           await Notification.insertMany(notifications);
 
@@ -1530,6 +1583,26 @@ router.post("/setup-account", async (req, res) => {
 // Complete Company Admin Onboarding
 router.post("/complete-company-onboarding", upload.single("logo"), async (req, res) => {
   try {
+    const getStoredLogoPath = (file) => {
+      if (!file) return null;
+      const directUrl = file.path || file.secure_url || file.url;
+      if (typeof directUrl === "string" && /^https?:\/\//i.test(directUrl)) {
+        return directUrl;
+      }
+      if (file.filename) {
+        return `/uploads/trainer-documents/${file.filename}`;
+      }
+      if (typeof directUrl === "string") {
+        const normalized = directUrl.replace(/\\/g, "/");
+        const marker = "/uploads/";
+        const markerIndex = normalized.toLowerCase().lastIndexOf(marker);
+        if (markerIndex >= 0) {
+          return normalized.slice(markerIndex);
+        }
+      }
+      return null;
+    };
+
     const { token, companyName, phone, address, adminName } = req.body;
 
     if (!token || !companyName || !phone || !address || !adminName) {
@@ -1566,7 +1639,7 @@ router.post("/complete-company-onboarding", upload.single("logo"), async (req, r
       phone,
       address,
       status: "active",
-      ...(req.file?.path ? { logo: req.file.path } : {}),
+      ...(getStoredLogoPath(req.file) ? { logo: getStoredLogoPath(req.file) } : {}),
     };
 
     const company = await Company.create(companyPayload);

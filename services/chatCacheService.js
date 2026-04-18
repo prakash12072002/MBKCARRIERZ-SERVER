@@ -52,7 +52,22 @@ const setCachedChats = async (userId, data) => {
   }
 };
 
+const deleteCachedChats = async (userId) => {
+  try {
+    const key = `chat:${userId}`;
+
+    if (isAvailable()) {
+      await redis.del(key);
+    } else {
+      memoryCache.delete(key);
+    }
+  } catch (err) {
+    console.warn("[Cache] Delete error:", err.message);
+  }
+};
+
 module.exports = {
   getCachedChats,
-  setCachedChats
+  setCachedChats,
+  deleteCachedChats,
 };

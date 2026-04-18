@@ -26,21 +26,24 @@ const resolveNotificationOwnerId = (req) => req.user?.id || req.user?._id;
 
 const getNotifications = async (req, res) => {
   try {
-    const page = parseInt(req.query.page, 10) || 1;
-    const limit = parseInt(req.query.limit, 10) || 20;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(20, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const startIndex = (page - 1) * limit;
     const ownerId = resolveNotificationOwnerId(req);
 
-    const notifications = await Notification.find({ userId: ownerId })
-      .sort("-createdAt")
-      .skip(startIndex)
-      .limit(limit);
-
-    const total = await Notification.countDocuments({ userId: ownerId });
-    const unreadCount = await Notification.countDocuments({
-      userId: ownerId,
-      isRead: false,
-    });
+    const [notifications, total, unreadCount] = await Promise.all([
+      Notification.find({ userId: ownerId })
+        .select("title message type isRead link createdAt")
+        .sort({ createdAt: -1 })
+        .skip(startIndex)
+        .limit(limit)
+        .lean(),
+      Notification.countDocuments({ userId: ownerId }),
+      Notification.countDocuments({
+        userId: ownerId,
+        isRead: false,
+      }),
+    ]);
 
     res.status(200).json({
       success: true,

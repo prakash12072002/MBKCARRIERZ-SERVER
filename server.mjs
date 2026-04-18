@@ -8,6 +8,7 @@ import { fileURLToPath } from "url";
 import cookieParser from "cookie-parser";
 import session from "express-session";
 import compression from "compression";
+import mongoose from "mongoose";
 
 // Route Imports
 import routes from "./routes/index.mjs";
@@ -29,6 +30,7 @@ const defaultAllowedOrigins = [
   "http://127.0.0.1:3000",
   "https://mbktechnologies.info",
   "https://www.mbktechnologies.info",
+  "https://*.mbktechnologies.info",
 ];
 const configuredOrigins = (process.env.CORS_ALLOWED_ORIGINS || "")
   .split(",")
@@ -39,9 +41,61 @@ const allowedOrigins = new Set(
   [...defaultAllowedOrigins, ...configuredOrigins].map(normalizeOrigin),
 );
 
+const isLocalDevOrigin = (origin = "") =>
+  /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(
+    normalizeOrigin(origin),
+  );
+
+const getDefaultPort = (protocol = "") => {
+  if (protocol === "https:") return "443";
+  if (protocol === "http:") return "80";
+  return "";
+};
+
+const wildcardOriginPattern = /^([a-z]+):\/\/\*\.(.+?)(?::(\d+))?$/i;
+
+const matchesAllowedOriginPattern = (origin, allowedOriginPattern) => {
+  const wildcardMatch = wildcardOriginPattern.exec(allowedOriginPattern);
+  if (!wildcardMatch) {
+    return false;
+  }
+
+  try {
+    const parsedOrigin = new URL(origin);
+    const [, protocol, hostSuffix, explicitPort = ""] = wildcardMatch;
+    const normalizedSuffix = hostSuffix.toLowerCase().replace(/^\.+/, "");
+    const originProtocol = parsedOrigin.protocol.toLowerCase();
+    const originHost = parsedOrigin.hostname.toLowerCase();
+    const originPort = parsedOrigin.port || getDefaultPort(originProtocol);
+    const allowedProtocol = `${protocol.toLowerCase()}:`;
+    const allowedPort = explicitPort || getDefaultPort(allowedProtocol);
+
+    return (
+      originProtocol === allowedProtocol &&
+      originPort === allowedPort &&
+      originHost.endsWith(`.${normalizedSuffix}`)
+    );
+  } catch {
+    return false;
+  }
+};
+
 const isAllowedOrigin = (origin) => {
   if (!origin) return true; // Allows same-server calls, curl, and health checks.
-  return allowedOrigins.has(normalizeOrigin(origin));
+  const normalizedOrigin = normalizeOrigin(origin);
+
+  // In local development, allow localhost/127.0.0.1 across ports
+  // so frontend port auto-switches (3000/3001/etc.) do not break API calls.
+  if (!isProduction && isLocalDevOrigin(normalizedOrigin)) {
+    return true;
+  }
+
+  return (
+    allowedOrigins.has(normalizedOrigin) ||
+    Array.from(allowedOrigins).some((allowedOrigin) =>
+      matchesAllowedOriginPattern(normalizedOrigin, allowedOrigin),
+    )
+  );
 };
 
 const corsOriginHandler = (origin, callback) => {
@@ -120,6 +174,20 @@ app.use('/uploads', express.static(uploadsDir, uploadsStaticOptions));
 app.use('/api/uploads', express.static(uploadsDir, uploadsStaticOptions));
 
 // Routes
+app.get("/api/health", (req, res) => {
+  const dbStatus = mongoose.connection.readyState === 1 ? "connected" : "disconnected";
+  res.json({
+    status: "ok",
+    uptime: Math.floor(process.uptime()),
+    database: dbStatus,
+    timestamp: new Date().toISOString(),
+    memory: {
+      rss: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB",
+      heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB",
+    }
+  });
+});
+
 app.use("/api", routes);
 
 // Root
