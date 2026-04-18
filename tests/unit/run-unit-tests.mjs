@@ -7446,7 +7446,7 @@ const tests = [
       assert.equal(approvalEmailPayload[0], "trainer.approved@example.com");
       assert.equal(approvalEmailPayload[1], "Trainer Approved");
       assert.equal(
-        String(approvalEmailPayload[2] || "").endsWith("/login/trainer"),
+        String(approvalEmailPayload[2] || "").endsWith("/login"),
         true,
       );
       assert.equal(approvalEmailPayload[3], "MBK301");
